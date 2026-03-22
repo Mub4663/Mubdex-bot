@@ -31,8 +31,8 @@ logging.basicConfig(level=logging.INFO,
 #  CONFIG
 # ══════════════════════════════════════════════════════════
 import os as _os
-BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID   = int(os.environ.get("ADMIN_ID", ""))
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", " ")
+ADMIN_ID   = int(os.environ.get("ADMIN_ID", " "))
 PROXY_URL  = os.environ.get("PROXY_URL", "")
 
 RPC_URL                  = os.environ.get("RPC_URL",
@@ -354,9 +354,9 @@ def do_swap(kp, fm, tm, raw_in):
     except Exception:
         pass
 
-    # Normal Jupiter with slippage ladder
+    # Normal Jupiter — slippage ladder 100→300→500→1000 bps
     last_err = "Unknown"
-    for slip in [100, 200, 500]:
+    for slip in [100, 300, 500, 1000]:
         try:
             for pair in JUPITER_PAIRS:
                 r = requests.get(pair["q"], params={
@@ -373,17 +373,38 @@ def do_swap(kp, fm, tm, raw_in):
                 if JUPITER_REFERRAL_ACCOUNT:
                     payload["feeAccount"] = JUPITER_REFERRAL_ACCOUNT
                 r2 = requests.post(pair["s"], json=payload, timeout=25)
-                if r2.status_code == 200 and "swapTransaction" in r2.json():
-                    d    = r2.json()
-                    txid = sign_send(base64.b64decode(d["swapTransaction"]), kp)
-                    out_raw = int(q.get("outAmount",0))
-                    out_dec = 9 if tm==SOL_MINT else tok_dec(tm)
-                    return txid, out_raw/(10**out_dec), False
+                if r2.status_code != 200: continue
+                d = r2.json()
+                if "swapTransaction" not in d: continue
+                txid = sign_send(base64.b64decode(d["swapTransaction"]), kp)
+                # ── Verify TX on-chain ─────────────────────────
+                time.sleep(3)
+                try:
+                    res = rpc("getSignatureStatuses",
+                        [[txid],{"searchTransactionHistory":True}])
+                    val = res["result"]["value"][0]
+                    if val and val.get("err"):
+                        err_info = val["err"]
+                        # Custom error 6014 = slippage — retry with higher
+                        if "6014" in str(err_info) or "Custom" in str(err_info):
+                            last_err = f"Slippage {slip/100:.1f}% too low (err:{err_info})"
+                            break  # try higher slippage
+                        raise RuntimeError(f"TX failed on-chain: {err_info}")
+                except RuntimeError:
+                    raise
+                except Exception:
+                    pass  # can't verify but assume OK
+                out_raw = int(q.get("outAmount",0))
+                out_dec = 9 if tm==SOL_MINT else tok_dec(tm)
+                return txid, out_raw/(10**out_dec), False
+        except RuntimeError:
+            raise
         except Exception as e:
             last_err = str(e)
-            if "custom': 1" in last_err.lower(): continue
+            if "custom': 1" in last_err.lower() or "6014" in last_err:
+                continue  # retry with higher slippage
             break
-    raise RuntimeError(f"Swap failed: {last_err}")
+    raise RuntimeError(f"Swap failed after all retries: {last_err}")
 
 # ══════════════════════════════════════════════════════════
 #  KEYBOARDS — The heart of the UX
@@ -1114,28 +1135,63 @@ def _execute_buy(uid, chat_id, mint, sol_amount):
         try:
             kp   = _users[uid]["keypair"]
             raw  = int(sol_amount*1e9)
+            # Show progress
+            for attempt_msg in ["⚡ Getting quote…", "⚡ Signing transaction…"]:
+                try:
+                    bot.edit_message_text(attempt_msg, chat_id, sent.message_id)
+                except Exception: pass
+                time.sleep(0.5)
             txid, out, gasless = do_swap(kp, SOL_MINT, mint, raw)
             sym  = token_info(mint).get("sym","?")
-            # Fee transparency
             fee_sol = sol_amount * 0.003
             fee_usd = fee_sol * (sol_price_usd() or 0)
-            bot.edit_message_text(
-                f"✅ *Buy Successful!*"
-                f"{'  ⚡ GASLESS!' if gasless else ''}\n\n"
-                f"💰 Spent: `{sol_amount} SOL`\n"
-                f"📥 Got: `{out:.4f} {sym}`\n\n"
-                f"📊 *Fee Breakdown:*\n"
-                f"  Gas: `{'$0.00 (gasless)' if gasless else '~$0.009'}`\n"
-                f"  Protocol: `{fee_sol:.5f} SOL (~${fee_usd:.3f})`\n\n"
-                f"[🔗 View TX](https://solscan.io/tx/{txid})",
-                chat_id, sent.message_id,
-                parse_mode="Markdown",
-                reply_markup=kb_back_main()
-            )
+            # Verify on-chain
+            try:
+                bot.edit_message_text("⏳ Confirming on-chain…", chat_id, sent.message_id)
+            except Exception: pass
+            confirmed = False
+            for _ in range(5):
+                time.sleep(3)
+                try:
+                    res = rpc("getSignatureStatuses",
+                        [[txid],{"searchTransactionHistory":True}])
+                    val = res["result"]["value"][0]
+                    if val:
+                        if val.get("err"):
+                            raise RuntimeError(f"TX failed on-chain: {val['err']}")
+                        if val.get("confirmationStatus") in ("confirmed","finalized"):
+                            confirmed = True; break
+                except RuntimeError: raise
+                except Exception: pass
+            status = "✅ *Buy Confirmed!*" if confirmed else "✅ *Buy Sent!* _(confirming…)_"
+            for attempt in range(3):
+                try:
+                    bot.edit_message_text(
+                        f"{status}"
+                        f"{'  ⚡ GASLESS!' if gasless else ''}\n\n"
+                        f"💰 Spent: `{sol_amount} SOL`\n"
+                        f"📥 Got: `{out:.4f} {sym}`\n\n"
+                        f"📊 *Fee Breakdown:*\n"
+                        f"  Gas: `{'$0.00 (gasless)' if gasless else '~$0.009'}`\n"
+                        f"  Protocol: `{fee_sol:.5f} SOL (~${fee_usd:.3f})`\n\n"
+                        f"[🔗 View TX](https://solscan.io/tx/{txid})",
+                        chat_id, sent.message_id,
+                        parse_mode="Markdown",
+                        reply_markup=kb_back_main()
+                    )
+                    break
+                except Exception:
+                    if attempt < 2: time.sleep(2)
         except Exception as e:
-            bot.edit_message_text(f"❌ Buy failed:\n`{str(e)[:200]}`",
-                chat_id, sent.message_id,
-                parse_mode="Markdown", reply_markup=kb_back_main())
+            for attempt in range(3):
+                try:
+                    bot.edit_message_text(
+                        f"❌ *Buy Failed*\n\n`{str(e)[:200]}`",
+                        chat_id, sent.message_id,
+                        parse_mode="Markdown", reply_markup=kb_back_main())
+                    break
+                except Exception:
+                    if attempt < 2: time.sleep(2)
     threading.Thread(target=_r, daemon=True).start()
 
 def _execute_sell(uid, chat_id, mint, pct):
