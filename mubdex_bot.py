@@ -30,9 +30,10 @@ logging.basicConfig(level=logging.INFO,
 # ══════════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════════
-import os as _os
-ADMIN_ID   = int(_os.environ.get("ADMIN_ID", "6237665352"))
-PROXY_URL  = _os.environ.get("PROXY_URL", "")
+import os
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
+PROXY_URL  = os.environ.get("PROXY_URL", "")
 
 RPC_URL                  = _os.environ.get("RPC_URL",
     "https://mainnet.helius-rpc.com/?api-key=92d43c65-101f-4053-a457-615a230bfd64")
@@ -739,8 +740,9 @@ class LimitOrder:
 if PROXY_URL:
     import telebot.apihelper as _ah
     _ah.proxy = {"https":PROXY_URL,"http":PROXY_URL}
-
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+  
+_token = os.environ.get("BOT_TOKEN", BOT_TOKEN)
+bot = telebot.TeleBot(_token, parse_mode=None)
 
 # ══════════════════════════════════════════════════════════
 #  HELPERS
