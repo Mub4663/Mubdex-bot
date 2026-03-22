@@ -30,12 +30,12 @@ logging.basicConfig(level=logging.INFO,
 # ══════════════════════════════════════════════════════════
 #  CONFIG
 # ══════════════════════════════════════════════════════════
-import os
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID   = int(os.environ.get("ADMIN_ID", "0"))
+import os as _os
+BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
+ADMIN_ID   = int(os.environ.get("ADMIN_ID", ""))
 PROXY_URL  = os.environ.get("PROXY_URL", "")
 
-RPC_URL                  = _os.environ.get("RPC_URL",
+RPC_URL                  = os.environ.get("RPC_URL",
     "https://mainnet.helius-rpc.com/?api-key=92d43c65-101f-4053-a457-615a230bfd64")
 JUPITER_REFERRAL_ACCOUNT = "EqwndckH8GvXoWT1vp5nTqD7KbJPzCEGWnC9XrfqW41x"
 JUPITER_FEE_BPS          = 50
@@ -740,9 +740,8 @@ class LimitOrder:
 if PROXY_URL:
     import telebot.apihelper as _ah
     _ah.proxy = {"https":PROXY_URL,"http":PROXY_URL}
-  
-_token = os.environ.get("BOT_TOKEN", BOT_TOKEN)
-bot = telebot.TeleBot(_token, parse_mode=None)
+
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
 # ══════════════════════════════════════════════════════════
 #  HELPERS
@@ -1506,10 +1505,7 @@ def handle_cb(call):
 #  STARTUP
 # ══════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    _env_token = os.environ.get("BOT_TOKEN","")
-    if _env_token:
-        bot.token = _env_token
-    elif BOT_TOKEN == "PASTE_BOT_TOKEN_HERE":
+    if not BOT_TOKEN:
         print("❌  Set BOT_TOKEN!")
         print("    Edit line 33 OR set env: BOT_TOKEN=your_token")
         exit(1)
