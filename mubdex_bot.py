@@ -356,7 +356,7 @@ def do_swap(kp, fm, tm, raw_in):
 
     # Normal Jupiter — slippage ladder 100→300→500→1000 bps
     last_err = "Unknown"
-    for slip in [100, 300, 500, 1000]:
+    for slip in [100, 300, 500, 1000, 1500, 2000, 2500]:  # up to 25%
         try:
             for pair in JUPITER_PAIRS:
                 r = requests.get(pair["q"], params={
@@ -470,9 +470,15 @@ def kb_trade(info, uid):
             callback_data=f"buy_{amt}_{info['mint']}"
         ))
     k.add(
-        types.InlineKeyboardButton("🟢 Buy custom", callback_data=f"buy_custom_{info['mint']}"),
-        types.InlineKeyboardButton("🔴 Sell 50%",   callback_data=f"sell_50_{info['mint']}"),
-        types.InlineKeyboardButton("🔴 Sell 100%",  callback_data=f"sell_100_{info['mint']}"),
+        types.InlineKeyboardButton("🟢 Buy custom",  callback_data=f"buy_custom_{info['mint']}"),
+        types.InlineKeyboardButton("🔴 Sell 50%",    callback_data=f"sell_50_{info['mint']}"),
+        types.InlineKeyboardButton("🔴 Sell 100%",   callback_data=f"sell_100_{info['mint']}"),
+    )
+    # Sell TO options
+    k.add(
+        types.InlineKeyboardButton("💵 Sell→USDT",  callback_data=f"sellto_USDT_{info['mint']}"),
+        types.InlineKeyboardButton("💵 Sell→USDC",  callback_data=f"sellto_USDC_{info['mint']}"),
+        types.InlineKeyboardButton("◎ Sell→SOL",    callback_data=f"sellto_SOL_{info['mint']}"),
     )
     k.add(
         types.InlineKeyboardButton("📋 Limit Order", callback_data=f"limit_{info['mint']}"),
@@ -1194,33 +1200,67 @@ def _execute_buy(uid, chat_id, mint, sol_amount):
                     if attempt < 2: time.sleep(2)
     threading.Thread(target=_r, daemon=True).start()
 
-def _execute_sell(uid, chat_id, mint, pct):
+def _execute_sell(uid, chat_id, mint, pct, to_mint=None):
+    if to_mint is None: to_mint = SOL_MINT
+    to_sym = next((k for k,v in KNOWN.items() if v==to_mint), "SOL")
     if not has_wallet(uid):
         bot.send_message(chat_id, "❌ No wallet connected.", reply_markup=kb_wallet(uid))
         return
-    sent = bot.send_message(chat_id, f"⚡ Selling {pct}% of tokens…")
+    sent = bot.send_message(chat_id,
+        f"⚡ Selling {pct}% → {to_sym}…")
     def _r():
         try:
             kp   = _users[uid]["keypair"]
             pub  = _users[uid]["pubkey"]
             toks = token_accs(pub)
-            t    = next((x for x in toks if x["mint"]==mint),None)
+            t    = next((x for x in toks if x["mint"]==mint), None)
             if not t or int(t["raw"])==0:
-                bot.edit_message_text("⚠️ Balance is 0 — nothing to sell.",
-                    chat_id, sent.message_id); return
-            raw = int(int(t["raw"]) * pct/100)
-            txid, out, gasless = do_swap(kp, mint, SOL_MINT, raw)
-            bot.edit_message_text(
-                f"✅ *Sold {pct}%!*\n\n"
-                f"📥 Got: `{out:.5f} SOL`\n"
-                f"[🔗 View TX](https://solscan.io/tx/{txid})",
-                chat_id, sent.message_id,
-                parse_mode="Markdown", reply_markup=kb_back_main()
-            )
+                bot.edit_message_text(
+                    "⚠️ *Balance is 0*\n\nNo tokens to sell.\n"
+                    "_Check Wallet → Balance first._",
+                    chat_id, sent.message_id,
+                    parse_mode="Markdown", reply_markup=kb_back_main()); return
+            raw  = int(int(t["raw"]) * pct/100)
+            txid, out, gasless = do_swap(kp, mint, to_mint, raw)
+            # Verify on-chain
+            confirmed = False
+            for _ in range(5):
+                time.sleep(3)
+                try:
+                    res = rpc("getSignatureStatuses",
+                        [[txid],{"searchTransactionHistory":True}])
+                    val = res["result"]["value"][0]
+                    if val:
+                        if val.get("err"):
+                            raise RuntimeError(f"TX failed: {val['err']}")
+                        if val.get("confirmationStatus") in ("confirmed","finalized"):
+                            confirmed = True; break
+                except RuntimeError: raise
+                except Exception: pass
+            status = "✅ *Sold!*" if confirmed else "✅ *Sell Sent!* _(confirming…)_"
+            out_dec = 9 if to_mint==SOL_MINT else tok_dec(to_mint)
+            for attempt in range(3):
+                try:
+                    bot.edit_message_text(
+                        f"{status}{'  ⚡ GASLESS!' if gasless else ''}\n\n"
+                        f"📥 Got: `{out:.5f} {to_sym}`\n"
+                        f"[🔗 View TX](https://solscan.io/tx/{txid})",
+                        chat_id, sent.message_id,
+                        parse_mode="Markdown", reply_markup=kb_back_main()
+                    )
+                    break
+                except Exception:
+                    if attempt < 2: time.sleep(2)
         except Exception as e:
-            bot.edit_message_text(f"❌ Sell failed: `{str(e)[:200]}`",
-                chat_id, sent.message_id,
-                parse_mode="Markdown", reply_markup=kb_back_main())
+            for attempt in range(3):
+                try:
+                    bot.edit_message_text(
+                        f"❌ *Sell Failed*\n\n`{str(e)[:200]}`",
+                        chat_id, sent.message_id,
+                        parse_mode="Markdown", reply_markup=kb_back_main())
+                    break
+                except Exception:
+                    if attempt < 2: time.sleep(2)
     threading.Thread(target=_r, daemon=True).start()
 
 # ══════════════════════════════════════════════════════════
@@ -1366,7 +1406,15 @@ def handle_cb(call):
         parts = data.split("_", 2)
         pct   = float(parts[1])
         mint  = parts[2]
-        _execute_sell(uid, call.message.chat.id, mint, pct)
+        _execute_sell(uid, call.message.chat.id, mint, pct, to_mint=SOL_MINT)
+
+    elif data.startswith("sellto_"):
+        # sellto_USDT_MINTADDRESS
+        parts    = data.split("_", 2)
+        to_sym   = parts[1]   # USDT / USDC / SOL
+        mint     = parts[2]
+        to_mint  = KNOWN.get(to_sym, SOL_MINT)
+        _execute_sell(uid, call.message.chat.id, mint, 100, to_mint=to_mint)
 
     # ── Safety ───────────────────────────────────────────
     elif data.startswith("safety_"):
