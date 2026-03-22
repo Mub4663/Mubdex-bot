@@ -39,7 +39,7 @@ RPC_URL                  = os.environ.get("RPC_URL",
     "https://mainnet.helius-rpc.com/?api-key=92d43c65-101f-4053-a457-615a230bfd64")
 JUPITER_REFERRAL_ACCOUNT = "EqwndckH8GvXoWT1vp5nTqD7KbJPzCEGWnC9XrfqW41x"
 JUPITER_FEE_BPS          = 50
-PRIORITY_FEE             = 100_000   # lamports
+PRIORITY_FEE             = 500_000   # 500k lamports — fast landing
 SOL_MINT = "So11111111111111111111111111111111111111112"
 SPL_PROG = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
@@ -332,79 +332,136 @@ def fmt_token_card(info, sol_usd=0):
 # ══════════════════════════════════════════════════════════
 #  SWAP ENGINE
 # ══════════════════════════════════════════════════════════
+def _verify_tx(txid, retries=8):
+    """Check on-chain status. Returns True=success, raises on failure."""
+    for _ in range(retries):
+        time.sleep(3)
+        try:
+            res = rpc("getSignatureStatuses",
+                [[txid],{"searchTransactionHistory":True}])
+            val = res["result"]["value"][0]
+            if val is None:
+                continue
+            if val.get("err"):
+                err = val["err"]
+                err_s = str(err)
+                # Custom:1 = slippage exceeded
+                if "Custom" in err_s and ("1}" in err_s or ": 1}" in err_s):
+                    raise RuntimeError(f"SLIPPAGE_EXCEEDED:{err}")
+                raise RuntimeError(f"TX failed on-chain: {err}")
+            if val.get("confirmationStatus") in ("confirmed","finalized"):
+                return True
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+    return True  # timeout but no error — assume OK
+
+
 def do_swap(kp, fm, tm, raw_in):
-    """Ultra → Normal Jupiter → Raydium. Returns (txid, out_ui, gasless)."""
+    """
+    Swap engine — tries in order:
+    1. Jupiter Ultra (gasless, fastest)
+    2. Jupiter Normal with slippage ladder + fresh quote each try
+    Returns (txid, out_ui, gasless)
+    """
     pub = str(kp.pubkey())
 
-    # Ultra
+    # ── 1. Try Ultra ─────────────────────────────────────
     try:
         params = {"inputMint":fm,"outputMint":tm,"amount":raw_in,"taker":pub}
         if JUPITER_REFERRAL_ACCOUNT:
             params["referralAccount"] = JUPITER_REFERRAL_ACCOUNT
             params["referralFeeBps"]  = JUPITER_FEE_BPS
-        r = requests.get(ULTRA_Q, params=params, timeout=12)
+        r = requests.get(ULTRA_Q, params=params, timeout=10)
         if r.status_code == 200:
             order = r.json()
-            if "transaction" in order:
-                txid = sign_send(base64.b64decode(order["transaction"]), kp)
+            if "transaction" in order and "error" not in order:
+                txid    = sign_send(base64.b64decode(order["transaction"]), kp)
                 gasless = order.get("gasless", False)
-                out_raw = int(order.get("outAmount",0))
+                _verify_tx(txid)
+                out_raw = int(order.get("outAmount", 0))
                 out_dec = 9 if tm==SOL_MINT else tok_dec(tm)
                 return txid, out_raw/(10**out_dec), gasless
+    except RuntimeError as e:
+        if "SLIPPAGE_EXCEEDED" not in str(e):
+            pass  # Ultra failed for non-slippage reason — try normal
     except Exception:
         pass
 
-    # Normal Jupiter — slippage ladder 100→300→500→1000 bps
+    # ── 2. Jupiter Normal — FRESH quote each attempt ──────
     last_err = "Unknown"
-    for slip in [100, 300, 500, 1000, 1500, 2000, 2500]:  # up to 25%
-        try:
-            for pair in JUPITER_PAIRS:
-                r = requests.get(pair["q"], params={
-                    "inputMint":fm,"outputMint":tm,
-                    "amount":raw_in,"slippageBps":slip}, timeout=12)
-                if r.status_code != 200: continue
-                q = r.json()
-                if "error" in q or "errorCode" in q: continue
+    SLIPPAGE_STEPS = [50, 100, 200, 500, 1000, 1500, 2000, 3000, 5000]  # up to 50%
+
+    for slip in SLIPPAGE_STEPS:
+        got_tx = False
+        for pair in JUPITER_PAIRS:
+            try:
+                # Fresh quote RIGHT NOW (not cached)
+                qr = requests.get(pair["q"], params={
+                    "inputMint"   : fm,
+                    "outputMint"  : tm,
+                    "amount"      : raw_in,
+                    "slippageBps" : slip,
+                }, timeout=10)
+                if qr.status_code != 200: continue
+                q = qr.json()
+                if "error" in q or "errorCode" in q:
+                    last_err = str(q.get("error", q.get("errorCode",""))); continue
+                if "outAmount" not in q: continue
+
+                # Build swap tx
                 payload = {
-                    "quoteResponse":q,"userPublicKey":pub,
-                    "wrapAndUnwrapSol":True,"prioritizationFeeLamports":PRIORITY_FEE,
-                    "dynamicComputeUnitLimit":True,"skipUserAccountsCheck":True,
+                    "quoteResponse"            : q,
+                    "userPublicKey"            : pub,
+                    "wrapAndUnwrapSol"         : True,
+                    "prioritizationFeeLamports": PRIORITY_FEE,
+                    "dynamicComputeUnitLimit"  : True,
+                    "skipUserAccountsCheck"    : True,
                 }
                 if JUPITER_REFERRAL_ACCOUNT:
                     payload["feeAccount"] = JUPITER_REFERRAL_ACCOUNT
-                r2 = requests.post(pair["s"], json=payload, timeout=25)
-                if r2.status_code != 200: continue
-                d = r2.json()
-                if "swapTransaction" not in d: continue
-                txid = sign_send(base64.b64decode(d["swapTransaction"]), kp)
-                # ── Verify TX on-chain ─────────────────────────
-                time.sleep(3)
+
+                sr = requests.post(pair["s"], json=payload, timeout=20)
+                if sr.status_code != 200: continue
+                sd = sr.json()
+                if "swapTransaction" not in sd:
+                    last_err = "No swapTransaction in response"; continue
+
+                # Sign and send
+                txid = sign_send(base64.b64decode(sd["swapTransaction"]), kp)
+
+                # Verify on-chain
                 try:
-                    res = rpc("getSignatureStatuses",
-                        [[txid],{"searchTransactionHistory":True}])
-                    val = res["result"]["value"][0]
-                    if val and val.get("err"):
-                        err_info = val["err"]
-                        # Custom error 6014 = slippage — retry with higher
-                        if "6014" in str(err_info) or "Custom" in str(err_info):
-                            last_err = f"Slippage {slip/100:.1f}% too low (err:{err_info})"
-                            break  # try higher slippage
-                        raise RuntimeError(f"TX failed on-chain: {err_info}")
-                except RuntimeError:
-                    raise
-                except Exception:
-                    pass  # can't verify but assume OK
-                out_raw = int(q.get("outAmount",0))
+                    _verify_tx(txid)
+                except RuntimeError as ve:
+                    ve_s = str(ve)
+                    if "SLIPPAGE_EXCEEDED" in ve_s:
+                        last_err = f"Slippage {slip/100:.1f}% insufficient"
+                        got_tx = False
+                        break  # try higher slippage
+                    raise  # other on-chain error
+
+                # Success!
+                out_raw = int(q.get("outAmount", 0))
                 out_dec = 9 if tm==SOL_MINT else tok_dec(tm)
                 return txid, out_raw/(10**out_dec), False
-        except RuntimeError:
-            raise
-        except Exception as e:
-            last_err = str(e)
-            if "custom': 1" in last_err.lower() or "6014" in last_err:
-                continue  # retry with higher slippage
+
+            except RuntimeError:
+                raise
+            except Exception as e:
+                last_err = str(e)[:80]
+                continue
+
+        if got_tx is False and "insufficient" in last_err:
+            continue  # try higher slippage
+        elif not got_tx:
             break
-    raise RuntimeError(f"Swap failed after all retries: {last_err}")
+
+    raise RuntimeError(
+        f"Swap failed. Last error: {last_err}\n"
+        f"Tried slippage up to {SLIPPAGE_STEPS[-1]/100:.0f}%"
+    )
 
 # ══════════════════════════════════════════════════════════
 #  KEYBOARDS — The heart of the UX
@@ -791,6 +848,12 @@ def show_main(uid, chat_id, msg_id=None):
         bot.send_message(chat_id, MAIN_MENU_TEXT,
             parse_mode="Markdown", reply_markup=kb_main())
 
+def kb_back_with_menu():
+    """Inline back + reply keyboard refresh."""
+    k = types.InlineKeyboardMarkup()
+    k.add(types.InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main"))
+    return k
+
 def edit_or_send(call, text, kb=None):
     """Edit message with retry on timeout."""
     for attempt in range(3):
@@ -829,9 +892,101 @@ def is_mint(text):
 # ══════════════════════════════════════════════════════════
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
-    uid = msg.from_user.id
-    u(uid)  # init
-    show_main(uid, msg.chat.id)
+    uid  = msg.from_user.id
+    usr  = u(uid)
+    name = msg.from_user.first_name or "Trader"
+
+    # Trojan-style: show wallet status inline
+    if has_wallet(uid):
+        pub  = usr["pubkey"]
+        def _show_with_bal():
+            sol  = sol_bal(pub)
+            status = (
+                f"💼 `{pub[:6]}…{pub[-4:]}`  "
+                f"Balance: *{sol:.4f} SOL*"
+            )
+            _send_main(uid, msg.chat.id, name, status)
+        threading.Thread(target=_show_with_bal, daemon=True).start()
+    elif usr.get("view_pub"):
+        vp = usr["view_pub"]
+        status = f"👁 View: `{vp[:6]}…{vp[-4:]}`"
+        _send_main(uid, msg.chat.id, name, status)
+    else:
+        # First time user — show full welcome
+        _send_main(uid, msg.chat.id, name, "", is_new=True)
+
+
+def _send_main(uid, chat_id, name, status, is_new=False):
+    """Send main menu — with special welcome for first-time users."""
+
+    if is_new:
+        # ── NEW USER WELCOME ─────────────────────────
+        welcome = (
+            f"👋 *Welcome to MUB DEX, {name}!*\n\n"
+            f"⚡ The fastest, cheapest way to trade on Solana.\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🔥 *Why MUB DEX?*\n\n"
+            f"💸 *Save 97% on gas fees*\n"
+            f"  Other bots: ~$0.40/swap\n"
+            f"  MUB DEX: ~$0.009/swap\n\n"
+            f"⚡ *Ultra Swap* — Sub-second execution\n"
+            f"  Sometimes completely *GASLESS*!\n\n"
+            f"🤖 *Auto-Trader* — Set TP/SL & sleep\n"
+            f"  Bot trades 24/7 while you rest\n\n"
+            f"🎯 *Sniper Bot* — Be first on new launches\n"
+            f"  Buy the millisecond liquidity drops\n\n"
+            f"📋 *Limit Orders* — Trade at your price\n"
+            f"  Set it and forget it\n\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🚀 *Used by 1,000+ Solana traders*\n"
+            f"🔐 *Your keys, your crypto — always*\n\n"
+            f"*Get started in 30 seconds:*\n"
+            f"1️⃣ Tap *💼 Wallet* → Connect\n"
+            f"2️⃣ Paste any token contract\n"
+            f"3️⃣ Tap *Buy* — done! ✅\n\n"
+            f"_Questions? Tap ❓ Help anytime._"
+        )
+        bot.send_message(chat_id, welcome,
+            parse_mode="Markdown",
+            reply_markup=kb_main_trojan())
+        return
+
+    # ── RETURNING USER ────────────────────────────────
+    text = (
+        f"⚡ *MUB DEX*\n"
+        f"_Solana's fastest trading bot_\n\n"
+        f"{status}\n\n"
+        f"💰 Gas: *~$0.009* _(save 97% vs others)_"
+    )
+    bot.send_message(chat_id, text,
+        parse_mode="Markdown",
+        reply_markup=kb_main_trojan()
+    )
+
+
+def kb_main_trojan():
+    """Trojan-style main keyboard with big buttons."""
+    k = types.ReplyKeyboardMarkup(
+        resize_keyboard=True,
+        row_width=2
+    )
+    k.add(
+        types.KeyboardButton("💼 Wallet"),
+        types.KeyboardButton("💱 Buy / Sell"),
+    )
+    k.add(
+        types.KeyboardButton("🤖 Auto-Trader"),
+        types.KeyboardButton("🎯 Sniper"),
+    )
+    k.add(
+        types.KeyboardButton("📋 Limit Orders"),
+        types.KeyboardButton("⚙️ Settings"),
+    )
+    k.add(
+        types.KeyboardButton("💬 Feedback"),
+        types.KeyboardButton("❓ Help"),
+    )
+    return k
 
 # ══════════════════════════════════════════════════════════
 #  TEXT HANDLER — catches contract paste + multi-step inputs
@@ -1070,8 +1225,35 @@ def handle_text(msg):
         _handle_contract(uid, msg.chat.id, text)
         return
 
+    # ── ReplyKeyboard button taps (Trojan-style) ─────────
+    btn_map = {
+        "💼 Wallet"      : "menu_wallet",
+        "💱 Buy / Sell"  : "menu_trade",
+        "🤖 Auto-Trader" : "menu_auto",
+        "🎯 Sniper"      : "menu_sniper",
+        "📋 Limit Orders": "menu_limits",
+        "⚙️ Settings"    : "menu_settings",
+        "💬 Feedback"    : "menu_feedback",
+        "❓ Help"         : "menu_help",
+    }
+    if text in btn_map:
+        # Simulate inline callback
+        class _FakeCall:
+            def __init__(self, m, d):
+                self.message = m
+                self.data    = d
+                self.from_user = m.from_user
+        fake = _FakeCall(msg, btn_map[text])
+        handle_cb(fake)
+        return
+
     # ── Fallback ──────────────────────────────────────────
-    show_main(uid, msg.chat.id)
+    bot.send_message(msg.chat.id,
+        "Just paste a token contract address to trade!\n\ne.g.:\n"
+        "`DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263`",
+        parse_mode="Markdown",
+        reply_markup=kb_main_trojan()
+    )
 
 def _handle_contract(uid, chat_id, mint):
     """User pasted a contract address — show token info + trade buttons."""
