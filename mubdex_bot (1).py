@@ -31,7 +31,6 @@ logging.basicConfig(level=logging.INFO,
 #  CONFIG
 # ══════════════════════════════════════════════════════════
 import os as _os
-BOT_TOKEN  = _os.environ.get("BOT_TOKEN", "8638899222:AAFdL7PsEzg_pnRX4ySP4C3RGLv8Fkcw9NE")
 ADMIN_ID   = int(_os.environ.get("ADMIN_ID", "6237665352"))
 PROXY_URL  = _os.environ.get("PROXY_URL", "")
 
