@@ -46,6 +46,50 @@ KNOWN = {
 
 DATA_FILE     = "mubdex_users.json"
 FEEDBACK_FILE = "mubdex_feedback.json"
+HISTORY_FILE  = "mubdex_history.json"
+
+# Token name cache — fetched from DexScreener
+_tok_name_cache = {}  # mint → {"sym":..., "name":...}
+
+def get_token_name(mint):
+    """Get token symbol/name from cache or DexScreener."""
+    if mint == SOL_MINT: return "SOL", "Solana"
+    sym = next((k for k,v in KNOWN.items() if v==mint), None)
+    if sym: return sym, sym
+    if mint in _tok_name_cache:
+        return _tok_name_cache[mint]["sym"], _tok_name_cache[mint]["name"]
+    try:
+        r = requests.get(DEX_URL.format(mint), timeout=5)
+        if r.status_code == 200:
+            pairs = r.json().get("pairs") or []
+            if pairs:
+                tok  = pairs[0].get("baseToken",{})
+                sym  = tok.get("symbol","?")
+                name = tok.get("name","?")
+                _tok_name_cache[mint] = {"sym":sym,"name":name}
+                return sym, name
+    except Exception: pass
+    return mint[:6]+"…"+mint[-4:], "Unknown"
+
+def save_history(uid, action):
+    """Save trade action to history."""
+    try:
+        history = json.load(open(HISTORY_FILE)) if os.path.exists(HISTORY_FILE) else {}
+        uid_s   = str(uid)
+        if uid_s not in history: history[uid_s] = []
+        history[uid_s].append(action)
+        # Keep last 50 per user
+        history[uid_s] = history[uid_s][-50:]
+        json.dump(history, open(HISTORY_FILE,"w"))
+    except Exception: pass
+
+def get_history(uid):
+    """Get user trade history."""
+    try:
+        history = json.load(open(HISTORY_FILE)) if os.path.exists(HISTORY_FILE) else {}
+        return history.get(str(uid), [])
+    except Exception: return []
+
 
 try:
     from solders.keypair import Keypair
@@ -65,7 +109,14 @@ _snipers = {}
 _limits  = {}
 
 def _xor(d, k): return bytes(b ^ k[i%len(k)] for i,b in enumerate(d))
-def _default_settings(): return {"default_buy":0.1,"auto_tp":20,"auto_sl":10}
+def _default_settings():
+    return {
+        "default_buy" : 0.1,
+        "auto_tp"     : 20,
+        "auto_sl"     : 10,
+        "max_slippage": 3000,   # bps — 30% default max (auto-escalates from 0.1%)
+        "swap_engine" : "ultra", # ultra | normal
+    }
 
 def _new_user():
     return {"keypair":None,"pubkey":None,"view_pub":None,"pk_b58":None,
@@ -94,9 +145,31 @@ def save_users():
             e["enc"]=base64.b64encode(_xor(uu["pk_b58"].encode(),k)).decode()
         if uu.get("view_pub"): e["view_pub"]=uu["view_pub"]
         if e.get("enc") or e.get("view_pub"): out[str(uid)]=e
-    json.dump(out,open(DATA_FILE,"w"))
+    json.dump(out, open(DATA_FILE,"w"))
+    # Also save as base64 env-compatible backup string
+    try:
+        backup = base64.b64encode(json.dumps(out).encode()).decode()
+        open(DATA_FILE+".bak","w").write(backup)
+    except Exception: pass
 
 def load_users():
+    # Try primary file, then backup
+    if not os.path.exists(DATA_FILE):
+        bak = DATA_FILE + ".bak"
+        if os.path.exists(bak):
+            try:
+                data = json.loads(base64.b64decode(open(bak).read()).decode())
+                json.dump(data, open(DATA_FILE,"w"))
+                logging.info("✅ Wallet restored from backup!")
+            except Exception: pass
+    # Also check WALLET_BACKUP env var (set manually on Railway)
+    env_bak = os.environ.get("WALLET_BACKUP","")
+    if env_bak and not os.path.exists(DATA_FILE):
+        try:
+            data = json.loads(base64.b64decode(env_bak).decode())
+            json.dump(data, open(DATA_FILE,"w"))
+            logging.info("✅ Wallet restored from WALLET_BACKUP env!")
+        except Exception: pass
     if not os.path.exists(DATA_FILE): return
     try:
         data=json.load(open(DATA_FILE))
@@ -177,21 +250,42 @@ def confirm_tx(txid, max_wait=45):
         except: pass
     raise RuntimeError("Confirmation timeout — check Solscan")
 
-# Slippage ladder — escalates automatically on each failure
-# Covers everything: normal tokens, pump.fun, high-tax, low-liq
-def get_slippage_steps(mint, fm):
+def get_slippage_steps(mint, fm, user_max_bps=None):
+    """
+    Smart slippage ladder starting from 0.1%.
+    Escalates automatically until TX succeeds or max is reached.
+    If user sets custom max, respects it.
+    """
     m = (mint or "").lower()
     f = (fm   or "").lower()
+
     if m.endswith("pump") or f.endswith("pump"):
-        # Pump.fun: start at 5%, go up to 25%
-        return [500, 1000, 1500, 2000, 2500]
-    # All other tokens: start at 1%, go up to 15%
-    return [100, 200, 500, 1000, 1500]
+        # Pump.fun tokens need higher slippage
+        steps = [100, 200, 500, 1000, 1500, 2000, 2500, 3000]
+    else:
+        # Normal tokens: start gentle, escalate
+        steps = [10, 50, 100, 200, 300, 500, 1000, 1500]
+
+    # Respect user's custom max slippage setting
+    if user_max_bps:
+        steps = [s for s in steps if s <= user_max_bps]
+        if not steps:
+            steps = [user_max_bps]
+    return steps
 
 def do_swap(kp, fm, tm, raw_in):
     pub = str(kp.pubkey())
 
-    # Try Ultra first
+    # Check user engine preference
+    use_ultra = True
+    for uid_s, uu in _users.items():
+        if uu.get("pubkey") == pub or uu.get("view_pub") == pub:
+            use_ultra = uu.get("settings", {}).get("swap_engine", "ultra") == "ultra"
+            break
+
+    # Try Ultra first (if enabled)
+    if not use_ultra:
+        raise Exception("Normal swap selected by user")
     try:
         params={"inputMint":fm,"outputMint":tm,"amount":raw_in,"taker":pub}
         if JUPITER_REFERRAL_ACCOUNT:
@@ -213,7 +307,13 @@ def do_swap(kp, fm, tm, raw_in):
 
     # Jupiter Normal — fresh quote each step
     last_err="No route"
-    slippage_steps = get_slippage_steps(tm, fm)
+    # Get user's max slippage preference if available
+    user_max = None
+    for uid_s, uu in _users.items():
+        if uu.get("pubkey") == pub or uu.get("view_pub") == pub:
+            user_max = uu.get("settings", {}).get("max_slippage", 3000)
+            break
+    slippage_steps = get_slippage_steps(tm, fm, user_max)
     for slip in slippage_steps:
         for pair in JUPITER_PAIRS:
             try:
@@ -308,6 +408,151 @@ def fmt_card(info):
     for w in info.get("warnings",[]): lines.append(w)
     if info.get("url"): lines.append(f"\n[📊 DexScreener]({info['url']})")
     return "\n".join(lines)
+
+def generate_trade_card(uid, sym, side, amount_in, amount_out,
+                         pnl_pct=None, pnl_sol=None, txid=""):
+    """
+    Generate a professional trade result card image.
+    Returns BytesIO PNG buffer.
+    """
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        import io, math
+
+        W, H  = 600, 340
+        is_profit = pnl_pct is None or pnl_pct >= 0
+        is_buy    = side.upper() == "BUY"
+
+        # Color scheme
+        if is_buy:
+            accent = (0, 200, 120)      # green
+            bg_top = (8, 28, 18)
+            bg_bot = (4, 16, 10)
+        elif is_profit:
+            accent = (0, 200, 120)
+            bg_top = (8, 28, 18)
+            bg_bot = (4, 16, 10)
+        else:
+            accent = (220, 60, 60)      # red
+            bg_top = (28, 8, 8)
+            bg_bot = (16, 4, 4)
+
+        img  = Image.new("RGB", (W, H))
+        draw = ImageDraw.Draw(img)
+
+        # Background gradient
+        for y in range(H):
+            t  = y/H
+            rc = int(bg_top[0]*(1-t) + bg_bot[0]*t)
+            gc = int(bg_top[1]*(1-t) + bg_bot[1]*t)
+            bc = int(bg_top[2]*(1-t) + bg_bot[2]*t)
+            draw.line([(0,y),(W,y)], fill=(rc,gc,bc))
+
+        # Top accent bar
+        draw.rectangle([(0,0),(W,4)], fill=accent)
+        draw.rectangle([(0,H-4),(W,H)], fill=accent)
+
+        # Fonts
+        try:
+            fp = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+            fn = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
+            f_big   = ImageFont.truetype(fp, 48)
+            f_med   = ImageFont.truetype(fp, 24)
+            f_small = ImageFont.truetype(fn, 16)
+            f_tiny  = ImageFont.truetype(fn, 13)
+        except:
+            f_big = f_med = f_small = f_tiny = ImageFont.load_default()
+
+        # MUB DEX logo area (left)
+        cx, cy = 90, 100
+        for r in range(60,0,-1):
+            t  = r/60
+            rc = int(8+20*t); gc=int(10+25*t); bc=int(25+45*t)
+            draw.ellipse([cx-r,cy-r,cx+r,cy+r],fill=(rc,gc,bc))
+        draw.ellipse([cx-58,cy-58,cx+58,cy+58],outline=(255,185,0,),width=3)
+        # Lightning bolt
+        bolt=[
+            (cx-10,cy-30),(cx-22,cy+5),(cx-5,cy+5),
+            (cx+12,cy+30),(cx+22,cy-5),(cx+5,cy-5)
+        ]
+        draw.polygon(bolt, fill=(255,185,0))
+        # MUB DEX text
+        draw.text((cx-28, cy+68), "MUB DEX", fill=(255,185,0), font=f_tiny)
+
+        # Vertical divider
+        draw.line([(168,20),(168,H-20)], fill=(*accent, 80), width=1)
+
+        # Right content
+        rx = 185
+
+        # Side badge
+        badge_col = (0,180,100) if is_buy else (200,50,50)
+        badge_txt = "🟢 BUY" if is_buy else "🔴 SELL"
+        draw.rounded_rectangle([rx, 18, rx+90, 44], radius=8, fill=badge_col)
+        draw.text((rx+8, 22), "BUY" if is_buy else "SELL",
+                  fill=(255,255,255), font=f_tiny)
+
+        # Token name
+        draw.text((rx, 52), f"${sym}", fill=(*accent,), font=f_med)
+
+        # P&L percentage (big)
+        if pnl_pct is not None:
+            pnl_col = (0,220,120) if pnl_pct >= 0 else (220,60,60)
+            pnl_str = f"+{pnl_pct:.2f}%" if pnl_pct >= 0 else f"{pnl_pct:.2f}%"
+            draw.text((rx, 85), pnl_str, fill=pnl_col, font=f_big)
+        else:
+            draw.text((rx, 85), f"✅ Swapped", fill=accent, font=f_med)
+
+        # Details
+        y_start = 155
+        details = [
+            ("In",  f"{amount_in:.5f} SOL"),
+            ("Out", f"{amount_out:.5f} {sym}"),
+        ]
+        if pnl_sol is not None:
+            pnl_s = f"+{pnl_sol:.5f} SOL" if pnl_sol>=0 else f"{pnl_sol:.5f} SOL"
+            details.append(("P&L SOL", pnl_s))
+
+        for i,(lbl,val) in enumerate(details):
+            y = y_start + i*32
+            draw.text((rx,    y), lbl+":", fill=(150,160,170), font=f_small)
+            draw.text((rx+100, y), val,    fill=(220,230,240), font=f_small)
+
+        # TX hash (truncated)
+        if txid:
+            short_tx = txid[:20]+"…"+txid[-6:]
+            draw.text((rx, H-50), "TX: "+short_tx, fill=(100,110,120), font=f_tiny)
+
+        # Timestamp
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+        draw.text((rx, H-32), ts, fill=(80,90,100), font=f_tiny)
+
+        # Candle decoration (right side)
+        cc = W - 60
+        if is_profit or is_buy:
+            # Green candle
+            draw.rectangle([cc-8, 240, cc+8, 290], fill=(0,180,100))
+            draw.line([(cc, 220),(cc, 310)], fill=(0,180,100), width=2)
+            draw.rectangle([cc+20-6, 260, cc+20+6, 295], fill=(0,140,80))
+            draw.line([(cc+20, 245),(cc+20, 310)], fill=(0,140,80), width=2)
+            draw.rectangle([cc+40-5, 250, cc+40+5, 290], fill=(0,200,120))
+            draw.line([(cc+40, 235),(cc+40, 305)], fill=(0,200,120), width=2)
+        else:
+            # Red candles
+            draw.rectangle([cc-8, 250, cc+8, 300], fill=(200,50,50))
+            draw.line([(cc, 235),(cc, 315)], fill=(200,50,50), width=2)
+            draw.rectangle([cc+20-6, 265, cc+20+6, 305], fill=(160,40,40))
+            draw.rectangle([cc+40-5, 270, cc+40+5, 310], fill=(220,60,60))
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return buf
+
+    except Exception as e:
+        logging.warning(f"Trade card error: {e}")
+        return None
+
 
 class AutoTrader:
     def __init__(self,uid,bot_i):
@@ -419,14 +664,16 @@ bot=telebot.TeleBot(BOT_TOKEN,parse_mode=None)
 
 def kb_main():
     k=types.InlineKeyboardMarkup(row_width=2)
-    k.add(types.InlineKeyboardButton("💼 Wallet",callback_data="menu_wallet"),
-          types.InlineKeyboardButton("💱 Buy / Sell",callback_data="menu_trade"))
+    k.add(types.InlineKeyboardButton("💼 Wallet",    callback_data="menu_wallet"),
+          types.InlineKeyboardButton("💱 Buy / Sell", callback_data="menu_trade"))
+    k.add(types.InlineKeyboardButton("🪙 My Tokens",  callback_data="menu_portfolio"),
+          types.InlineKeyboardButton("📜 History",    callback_data="menu_history"))
     k.add(types.InlineKeyboardButton("🤖 Auto-Trader",callback_data="menu_auto"),
-          types.InlineKeyboardButton("🎯 Sniper Bot",callback_data="menu_sniper"))
-    k.add(types.InlineKeyboardButton("📋 Limit Orders",callback_data="menu_limits"),
-          types.InlineKeyboardButton("⚙️ Settings",callback_data="menu_settings"))
-    k.add(types.InlineKeyboardButton("💬 Feedback",callback_data="menu_feedback"),
-          types.InlineKeyboardButton("❓ Help",callback_data="menu_help"))
+          types.InlineKeyboardButton("🎯 Sniper Bot", callback_data="menu_sniper"))
+    k.add(types.InlineKeyboardButton("📋 Limits",    callback_data="menu_limits"),
+          types.InlineKeyboardButton("⚙️ Settings",  callback_data="menu_settings"))
+    k.add(types.InlineKeyboardButton("💬 Feedback",  callback_data="menu_feedback"),
+          types.InlineKeyboardButton("❓ Help",        callback_data="menu_help"))
     return k
 
 def kb_wallet(uid):
@@ -482,12 +729,36 @@ def kb_back():
     return k
 
 def kb_settings(uid):
-    s=u(uid)["settings"]
-    k=types.InlineKeyboardMarkup(row_width=2)
-    k.add(types.InlineKeyboardButton(f"💰 Buy: {s['default_buy']} SOL",callback_data="set_default_buy"),
-          types.InlineKeyboardButton(f"🎯 TP: {s['auto_tp']}%",callback_data="set_tp"))
-    k.add(types.InlineKeyboardButton(f"🛑 SL: {s['auto_sl']}%",callback_data="set_sl"))
-    k.add(types.InlineKeyboardButton("🔙 Main Menu",callback_data="menu_main"))
+    s   = u(uid)["settings"]
+    eng = s.get("swap_engine","ultra")
+    msl = s.get("max_slippage", 3000)
+    k   = types.InlineKeyboardMarkup(row_width=2)
+    k.add(
+        types.InlineKeyboardButton(
+            f"💰 Default Buy: {s['default_buy']} SOL",
+            callback_data="set_default_buy"),
+        types.InlineKeyboardButton(
+            f"🎯 Auto TP: {s['auto_tp']}%",
+            callback_data="set_tp"),
+    )
+    k.add(
+        types.InlineKeyboardButton(
+            f"🛑 Auto SL: {s['auto_sl']}%",
+            callback_data="set_sl"),
+        types.InlineKeyboardButton(
+            f"📉 Max Slippage: {msl//100}%",
+            callback_data="set_slippage"),
+    )
+    # Swap engine toggle
+    k.add(
+        types.InlineKeyboardButton(
+            f"{'✅' if eng=='ultra' else '⬜'} ⚡ Ultra Swap",
+            callback_data="set_engine_ultra"),
+        types.InlineKeyboardButton(
+            f"{'✅' if eng=='normal' else '⬜'} 🔄 Normal Swap",
+            callback_data="set_engine_normal"),
+    )
+    k.add(types.InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main"))
     return k
 
 MAIN_TEXT="⚡ *MUB DEX*\n_Solana's Fastest Trading Bot_\n\n💰 Gas: *~$0.009* _(save 97% vs others)_\n\nChoose an option:"
@@ -512,6 +783,12 @@ def eor(call,text,kb=None):
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
     uid=msg.from_user.id; usr=u(uid); name=msg.from_user.first_name or "Trader"
+    # Remove any old reply keyboard that may be persisting
+    bot.send_message(msg.chat.id, "⚡",
+        reply_markup=types.ReplyKeyboardRemove())
+    try: bot.delete_message(msg.chat.id, msg.message_id + 1)
+    except: pass
+
     if not has_any(uid):
         bot.send_message(msg.chat.id,
             f"👋 *Welcome to MUB DEX, {name}!*\n\n"
@@ -633,9 +910,18 @@ def handle_text(msg):
         except ValueError: bot.send_message(msg.chat.id,"❌ Invalid amount.")
         return
 
-    if state in ("set_default_buy","set_tp","set_sl"):
+    if state in ("set_default_buy","set_tp","set_sl","set_slippage"):
         try:
-            val=float(text); key={"set_default_buy":"default_buy","set_tp":"auto_tp","set_sl":"auto_sl"}[state]
+            val=float(text)
+            if state=="set_slippage":
+                # Convert % to bps
+                bps = int(val * 100)
+                bps = max(50, min(bps, 5000))  # clamp 0.5%-50%
+                u(uid)["settings"]["max_slippage"] = bps
+                u(uid)["state"] = "idle"; save_users()
+                bot.send_message(msg.chat.id,f"✅ Max slippage set to `{val}%`\n_Bot will try from 0.1% up to {val}%_",parse_mode="Markdown",reply_markup=kb_settings(uid))
+                return
+            key={"set_default_buy":"default_buy","set_tp":"auto_tp","set_sl":"auto_sl"}.get(state,state)
             usr["settings"][key]=val; usr["state"]="idle"; save_users()
             bot.send_message(msg.chat.id,f"✅ Updated `{key}` = `{val}`",parse_mode="Markdown",reply_markup=kb_settings(uid))
         except ValueError: bot.send_message(msg.chat.id,"❌ Invalid number.")
@@ -681,30 +967,85 @@ def _exec_buy(uid,chat_id,mint,sol_amount):
     pub=_users[uid]["pubkey"]; bal=sol_bal(pub)
     if bal<sol_amount+0.002:
         bot.send_message(chat_id,f"❌ *Insufficient balance*\n\nYou have: `{bal:.4f} SOL`\nNeed: `{sol_amount+0.002:.4f} SOL`",parse_mode="Markdown",reply_markup=kb_back()); return
-    sent=bot.send_message(chat_id,f"⏳ *Buying {sol_amount} SOL…*\n_Getting fresh quote…_",parse_mode="Markdown")
+    sp        = sol_usd() or 0
+    gas_sol   = 0.000005
+    gas_usd   = gas_sol * sp
+    proto_sol = sol_amount * 0.003
+    proto_usd = proto_sol * sp
+    # Check if first time receiving this token (ATA rent)
+    pub        = _users[uid]["pubkey"]
+    user_toks  = token_accs(pub)
+    has_ata    = any(t["mint"]==mint for t in user_toks)
+    ata_sol    = 0.0 if has_ata else 0.00203928
+    ata_usd    = ata_sol * sp
+    total_fee  = gas_sol + proto_sol + ata_sol
+
+    sent=bot.send_message(chat_id,
+        f"📊 *Fee Preview*\n\n"
+        f"💰 Swap: `{sol_amount} SOL`\n\n"
+        f"📋 *Estimated Fees:*\n"
+        f"  ⛽ Network gas: `{gas_sol:.6f} SOL` (~${gas_usd:.4f})\n"
+        f"  🔄 Protocol (0.3%): `{proto_sol:.6f} SOL` (~${proto_usd:.4f})\n"
+        + (f"  🏦 ATA rent (first time): `{ata_sol:.6f} SOL` (~${ata_usd:.3f})\n" if ata_sol>0 else "")
+        + f"  ─────────────\n"
+        f"  💸 Total fees: `{total_fee:.6f} SOL` (~${total_fee*sp:.3f})\n\n"
+        f"⏳ _Executing swap…_",
+        parse_mode="Markdown")
+
     def _r():
         try:
             kp=_users[uid]["keypair"]
-            try: bot.edit_message_text(f"⏳ *Buying {sol_amount} SOL…*\n_Signing transaction…_",chat_id,sent.message_id,parse_mode="Markdown")
+            try: bot.edit_message_text(
+                f"📊 *Fee Preview*\n✅ _Fees accepted — signing…_",
+                chat_id,sent.message_id,parse_mode="Markdown")
             except: pass
+
             txid,out,gasless=do_swap(kp,SOL_MINT,mint,int(sol_amount*1e9))
-            sym=token_info(mint).get("sym","?"); fee_sol=sol_amount*0.003; fee_usd=fee_sol*(sol_usd() or 0)
+            sym,sname=get_token_name(mint)
+            sp2=sol_usd() or 0
+            fee_sol=sol_amount*0.003; fee_usd=fee_sol*sp2
+
+            # Save to history
+            save_history(uid,{
+                "type":"BUY","sym":sym,"mint":mint,
+                "in_sol":sol_amount,"out_tok":out,
+                "fee_sol":total_fee,"gasless":gasless,
+                "txid":txid,"time":datetime.now().isoformat()
+            })
+
+            msg_text = (
+                f"✅ *Buy Confirmed!*{'  ⚡ GASLESS!' if gasless else ''}\n\n"
+                f"💰 Spent: `{sol_amount} SOL`\n"
+                f"📥 Got: `{out:.6f} {sym}`\n\n"
+                f"📊 *Actual Fees:*\n"
+                f"  ⛽ Gas: `{'$0.00' if gasless else f'~${gas_usd:.4f}'}`\n"
+                f"  🔄 Protocol: `{fee_sol:.6f} SOL (~${fee_usd:.4f})`\n"
+                + (f"  🏦 ATA rent: `{ata_sol:.6f} SOL` (one-time)\n" if ata_sol>0 else "")
+                + f"\n[🔗 View on Solscan](https://solscan.io/tx/{txid})"
+            )
+
             for i in range(3):
                 try:
-                    bot.edit_message_text(
-                        f"✅ *Buy Confirmed!*{'  ⚡ GASLESS!' if gasless else ''}\n\n"
-                        f"💰 Spent: `{sol_amount} SOL`\n"
-                        f"📥 Got: `{out:.6f} {sym}`\n\n"
-                        f"📊 *Fee Breakdown:*\n"
-                        f"  Gas: `{'$0.00 (gasless)' if gasless else '~$0.009'}`\n"
-                        f"  Protocol: `{fee_sol:.5f} SOL (~${fee_usd:.3f})`\n\n"
-                        f"[🔗 View on Solscan](https://solscan.io/tx/{txid})",
-                        chat_id,sent.message_id,parse_mode="Markdown",reply_markup=kb_back()); break
+                    bot.edit_message_text(msg_text,chat_id,sent.message_id,
+                        parse_mode="Markdown",reply_markup=kb_back()); break
                 except Exception:
                     if i<2: time.sleep(2)
+
+            # Send trade card image
+            try:
+                card = generate_trade_card(uid, sym, "BUY", sol_amount, out, txid=txid)
+                if card:
+                    k_share = types.InlineKeyboardMarkup()
+                    k_share.add(types.InlineKeyboardButton("📤 Share Result", callback_data=f"share_noop"))
+                    bot.send_photo(chat_id, card,
+                        caption=f"⚡ *MUB DEX Trade* — Bought ${sym}",
+                        parse_mode="Markdown", reply_markup=k_share)
+            except Exception: pass
+
         except Exception as e:
             for i in range(3):
-                try: bot.edit_message_text(f"❌ *Buy Failed*\n\n`{str(e)[:300]}`",chat_id,sent.message_id,parse_mode="Markdown",reply_markup=kb_back()); break
+                try: bot.edit_message_text(f"❌ *Buy Failed*\n\n`{str(e)[:300]}`",
+                    chat_id,sent.message_id,parse_mode="Markdown",reply_markup=kb_back()); break
                 except Exception:
                     if i<2: time.sleep(2)
     threading.Thread(target=_r,daemon=True).start()
@@ -833,13 +1174,134 @@ def handle_cb(call):
         usr["ctx"]["direction"]="below"; usr["state"]="awaiting_limit_price"
         eor(call,"📋 *New Limit Order*\n\nEnter target price in USD.\ne.g. `0.0001234`",kb=kb_back())
     elif data=="menu_settings":
-        eor(call,"⚙️ *Settings*\n\nTap to change:",kb=kb_settings(uid))
+        s   = u(uid)["settings"]
+        eng = s.get("swap_engine","ultra")
+        msl = s.get("max_slippage",3000)
+        s   = u(uid)["settings"]
+        eng = s.get("swap_engine","ultra")
+        msl = s.get("max_slippage",3000)
+        eng_txt = "Ultra ⚡ (gasless)" if eng=="ultra" else "Normal 🔄"
+        eor(call,
+            "⚙️ *Settings*\n\n"
+            f"💰 Default Buy: `{s['default_buy']} SOL`\n"
+            f"🎯 Auto TP: `{s['auto_tp']}%`\n"
+            f"🛑 Auto SL: `{s['auto_sl']}%`\n"
+            f"📉 Max Slippage: `{msl//100}%` _(auto-starts from 0.1%)_\n"
+            f"⚡ Engine: `{eng_txt}`\n\n"
+            "_Tap to change:_",
+            kb=kb_settings(uid))
+
     elif data=="set_default_buy":
-        usr["state"]="set_default_buy"; bot.send_message(call.message.chat.id,"Enter default buy amount (SOL):\ne.g. `0.1`",parse_mode="Markdown")
+        usr["state"]="set_default_buy"
+        usr["state"]="set_default_buy"
+        bot.send_message(call.message.chat.id,"Enter default buy amount (SOL):\ne.g. `0.1`",parse_mode="Markdown")
+
     elif data=="set_tp":
-        usr["state"]="set_tp"; bot.send_message(call.message.chat.id,"Enter Take-Profit %:\ne.g. `20`",parse_mode="Markdown")
+        usr["state"]="set_tp"
+        bot.send_message(call.message.chat.id,
+            "Enter Take-Profit %:e.g. `20`",
+            parse_mode="Markdown")
+
     elif data=="set_sl":
-        usr["state"]="set_sl"; bot.send_message(call.message.chat.id,"Enter Stop-Loss %:\ne.g. `10`",parse_mode="Markdown")
+        usr["state"]="set_sl"
+        bot.send_message(call.message.chat.id,
+            "Enter Stop-Loss %:e.g. `10`",
+            parse_mode="Markdown")
+
+    elif data=="set_slippage":
+        usr["state"]="set_slippage"
+        bot.send_message(call.message.chat.id,
+            "📉 *Set Max Slippage*"
+            "Bot auto-starts from 0.1% and escalates until TX succeeds."
+            "This sets the MAXIMUM it will try."
+            "Enter max slippage %:"
+            "`5`  = safe (stable tokens)"
+            "`15` = recommended (most tokens)"
+            "`30` = aggressive (pump.fun / low liq)"
+            "`50` = maximum",
+            parse_mode="Markdown")
+
+    elif data=="set_engine_ultra":
+        u(uid)["settings"]["swap_engine"] = "ultra"
+        save_users()
+        eor(call,"✅ *Ultra Swap enabled*_Gasless + fastest. Falls back to Normal if needed._",
+            kb=kb_settings(uid))
+
+    elif data=="set_engine_normal":
+        u(uid)["settings"]["swap_engine"] = "normal"
+        save_users()
+        eor(call,"✅ *Normal Swap enabled*_Reliable Jupiter routing._",
+            kb=kb_settings(uid))
+    elif data=="menu_portfolio":
+        def _portfolio():
+            pub = active_pub(uid)
+            if not pub:
+                bot.send_message(call.message.chat.id,
+                    "❌ No wallet connected.", reply_markup=kb_wallet(uid)); return
+            toks = token_accs(pub)
+            sol  = sol_bal(pub)
+            sp   = sol_usd() or 0
+            if not toks:
+                eor(call,
+                    f"🪙 *My Tokens*\n\n"
+                    f"◎ SOL: `{sol:.5f}` _(${sol*sp:.2f})_\n\n"
+                    "_No tokens found._\n\nSwap some tokens first!",
+                    kb=kb_back())
+                return
+            # Build token list with sell buttons
+            lines = [f"🪙 *My Tokens*\n\n◎ SOL: `{sol:.5f}` _(${sol*sp:.2f})_\n"]
+            k     = types.InlineKeyboardMarkup(row_width=2)
+            for t in toks[:8]:  # max 8 tokens
+                sym, name = get_token_name(t["mint"])
+                lines.append(f"• *{sym}*: `{t['amount']}`")
+                k.add(
+                    types.InlineKeyboardButton(
+                        f"🔴 Sell {sym}",
+                        callback_data=f"sell_100_{t['mint']}"),
+                    types.InlineKeyboardButton(
+                        f"📊 {sym}",
+                        callback_data=f"tok_info_{t['mint']}"),
+                )
+            k.add(types.InlineKeyboardButton("🔙 Main Menu", callback_data="menu_main"))
+            try:
+                bot.edit_message_text(
+                    "\n".join(lines),
+                    call.message.chat.id, call.message.message_id,
+                    parse_mode="Markdown", reply_markup=k)
+            except Exception:
+                bot.send_message(call.message.chat.id,
+                    "\n".join(lines),
+                    parse_mode="Markdown", reply_markup=k)
+        threading.Thread(target=_portfolio, daemon=True).start()
+
+    elif data.startswith("tok_info_"):
+        mint = data.replace("tok_info_","")
+        _show_token(uid, call.message.chat.id, mint)
+
+    elif data=="menu_history":
+        hist = get_history(uid)
+        if not hist:
+            eor(call,
+                "📜 *Trade History*\n\n_No trades yet._\n\nStart trading to see history!",
+                kb=kb_back())
+            return
+        lines = ["📜 *Trade History* (last 10)\n"]
+        for h in reversed(hist[-10:]):
+            t    = h.get("type","?")
+            sym  = h.get("sym","?")
+            in_s = h.get("in_sol",0)
+            out  = h.get("out_tok",0)
+            ts   = h.get("time","")[:10]
+            icon = "🟢" if t=="BUY" else "🔴"
+            lines.append(
+                f"{icon} *{t}* ${sym} | {in_s:.4f} SOL → {out:.4f}\n"
+                f"   _{ts}_"
+            )
+        eor(call, "\n".join(lines), kb=kb_back())
+
+    elif data=="share_noop":
+        bot.answer_callback_query(call.id, "Share this image with friends! 📤")
+
     elif data=="menu_feedback":
         usr["state"]="awaiting_feedback"
         eor(call,"💬 *Send Feedback*\n\nWhat do you think? Bugs or suggestions?\n\n_Type your message:_",kb=kb_back())
