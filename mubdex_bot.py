@@ -17,7 +17,7 @@ logging.basicConfig(level=logging.INFO,
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "6237665352"))
 PROXY_URL  = os.environ.get("PROXY_URL", "")
-RPC_URL    = "https://api.mainnet-beta.solana.com"
+RPC_URL    = os.environ.get("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=92d43c65-101f-4053-a457-615a230bfd64")
 
 JUPITER_REFERRAL_ACCOUNT = "EqwndckH8GvXoWT1vp5nTqD7KbJPzCEGWnC9XrfqW41x"
 JUPITER_FEE_BPS          = 50
@@ -177,7 +177,16 @@ def confirm_tx(txid, max_wait=45):
         except: pass
     raise RuntimeError("Confirmation timeout — check Solscan")
 
-SLIPPAGE_STEPS = [50, 100, 200, 300, 500]
+# Slippage ladder — escalates automatically on each failure
+# Covers everything: normal tokens, pump.fun, high-tax, low-liq
+def get_slippage_steps(mint, fm):
+    m = (mint or "").lower()
+    f = (fm   or "").lower()
+    if m.endswith("pump") or f.endswith("pump"):
+        # Pump.fun: start at 5%, go up to 25%
+        return [500, 1000, 1500, 2000, 2500]
+    # All other tokens: start at 1%, go up to 15%
+    return [100, 200, 500, 1000, 1500]
 
 def do_swap(kp, fm, tm, raw_in):
     pub = str(kp.pubkey())
@@ -204,7 +213,8 @@ def do_swap(kp, fm, tm, raw_in):
 
     # Jupiter Normal — fresh quote each step
     last_err="No route"
-    for slip in SLIPPAGE_STEPS:
+    slippage_steps = get_slippage_steps(tm, fm)
+    for slip in slippage_steps:
         for pair in JUPITER_PAIRS:
             try:
                 qr=requests.get(pair["q"],params={
@@ -235,11 +245,18 @@ def do_swap(kp, fm, tm, raw_in):
                 es=str(e)
                 if "No liquidity" in es: raise
                 if "Custom" in es and "1}" in es:
-                    last_err=f"Slippage {slip/100:.1f}% low"; break
+                    last_err=f"SLIPPAGE_LOW:{slip}"; break  # signal to retry higher
                 last_err=es; continue
             except Exception as e:
                 last_err=str(e)[:80]; continue
 
+    if "SLIPPAGE_LOW" in last_err:
+        bps = last_err.split(":")[-1] if ":" in last_err else "1500"
+        raise RuntimeError(
+            f"Token has very high price impact — even {int(bps)//100}% slippage is too low.\n"
+            f"This token may have:\n• Very low liquidity\n• High buy/sell tax\n• Extreme volatility\n\n"
+            f"Try a more liquid token or use Safety Check first."
+        )
     raise RuntimeError(f"Swap failed: {last_err}")
 
 def token_info(mint):
@@ -641,7 +658,11 @@ def handle_text(msg):
     bot.send_message(msg.chat.id,"⚡ *MUB DEX*\n\nPaste a token contract address to trade:",parse_mode="Markdown",reply_markup=kb_main())
 
 def _show_token(uid,chat_id,mint):
-    sent=bot.send_message(chat_id,"⏳ *Loading token info…*",parse_mode="Markdown")
+    is_pump_token = mint.lower().endswith("pump")
+    pump_note = "\n_⚡ Pump.fun token — higher slippage used_" if mint.lower().endswith("pump") else ""
+    sent=bot.send_message(chat_id,
+        "⏳ *Loading token info…*" + pump_note,
+        parse_mode="Markdown")
     def _r():
         info=token_info(mint)
         txt=fmt_card(info) if info["found"] else f"⚠️ *Token not found*\n`{mint[:20]}…`\n\nMay be very new. You can still try to buy."
@@ -672,7 +693,8 @@ def _exec_buy(uid,chat_id,mint,sol_amount):
                 try:
                     bot.edit_message_text(
                         f"✅ *Buy Confirmed!*{'  ⚡ GASLESS!' if gasless else ''}\n\n"
-                        f"💰 Spent: `{sol_amount} SOL`\n📥 Got: `{out:.6f} {sym}`\n\n"
+                        f"💰 Spent: `{sol_amount} SOL`\n"
+                        f"📥 Got: `{out:.6f} {sym}`\n\n"
                         f"📊 *Fee Breakdown:*\n"
                         f"  Gas: `{'$0.00 (gasless)' if gasless else '~$0.009'}`\n"
                         f"  Protocol: `{fee_sol:.5f} SOL (~${fee_usd:.3f})`\n\n"
@@ -841,17 +863,45 @@ def cmd_send(msg):
     sent=bot.reply_to(msg,f"📤 Sending `{amt} SOL`…",parse_mode="Markdown")
     def _r():
         try:
-            kp=_users[uid]["keypair"]
-            ix=transfer(TransferParams(from_pubkey=kp.pubkey(),to_pubkey=Pubkey.from_string(to_addr),lamports=int(amt*1e9)))
-            bh=Hash.from_string(get_blockhash()); msg2=Message.new_with_blockhash([ix],kp.pubkey(),bh)
-            signed=VersionedTransaction(msg2,[kp]); raw=base64.b64encode(bytes(signed)).decode()
-            res=rpc("sendTransaction",[raw,{"encoding":"base64","skipPreflight":True,"preflightCommitment":"processed","maxRetries":5}])
-            if "error" in res: raise RuntimeError(str(res["error"]))
-            txid=res["result"]; confirm_tx(txid)
-            bot.edit_message_text(f"✅ *Sent!*\n\nAmount: `{amt} SOL`\nTo: `{fmt_addr(to_addr)}`\n\n[🔗 View TX](https://solscan.io/tx/{txid})",sent.chat.id,sent.message_id,parse_mode="Markdown",reply_markup=kb_back())
+            kp  = _users[uid]["keypair"]
+            # Build legacy transfer instruction
+            ix  = transfer(TransferParams(
+                from_pubkey=kp.pubkey(),
+                to_pubkey=Pubkey.from_string(to_addr),
+                lamports=int(amt * 1e9)
+            ))
+            # Get fresh blockhash
+            bh  = Hash.from_string(get_blockhash())
+            # Build message
+            msg2 = Message.new_with_blockhash([ix], kp.pubkey(), bh)
+            # Sign using VersionedTransaction (correct way)
+            signed = VersionedTransaction(msg2, [kp])
+            raw    = base64.b64encode(bytes(signed)).decode()
+            # Send
+            res = rpc("sendTransaction", [raw, {
+                "encoding"           : "base64",
+                "skipPreflight"      : True,
+                "preflightCommitment": "processed",
+                "maxRetries"         : 5,
+            }])
+            if "error" in res:
+                raise RuntimeError(str(res["error"]))
+            txid = res["result"]
+            # Confirm on-chain
+            confirm_tx(txid)
+            bot.edit_message_text(
+                f"✅ *Sent Successfully!*\n\n"
+                f"💰 Amount: `{amt} SOL`\n"
+                f"📤 To: `{fmt_addr(to_addr)}`\n\n"
+                f"[🔗 View TX](https://solscan.io/tx/{txid})",
+                sent.chat.id, sent.message_id,
+                parse_mode="Markdown", reply_markup=kb_back())
         except Exception as e:
-            bot.edit_message_text(f"❌ Send failed: `{e}`",sent.chat.id,sent.message_id,parse_mode="Markdown")
-    threading.Thread(target=_r,daemon=True).start()
+            bot.edit_message_text(
+                f"❌ *Send Failed*\n\n`{str(e)[:200]}`",
+                sent.chat.id, sent.message_id,
+                parse_mode="Markdown", reply_markup=kb_back())
+    threading.Thread(target=_r, daemon=True).start()
 
 if __name__=="__main__":
     if not BOT_TOKEN: print("❌ Set BOT_TOKEN env variable"); exit(1)
