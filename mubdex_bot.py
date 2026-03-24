@@ -47,6 +47,58 @@ KNOWN = {
 DATA_FILE     = "mubdex_users.json"
 FEEDBACK_FILE = "mubdex_feedback.json"
 HISTORY_FILE  = "mubdex_history.json"
+STATS_FILE    = "mubdex_stats.json"
+
+_active_users = {}  # uid → last_seen timestamp
+
+def track_user(uid, name=""):
+    """Track user activity for admin dashboard."""
+    _active_users[uid] = {
+        "time" : time.time(),
+        "name" : name,
+    }
+    # Save stats
+    try:
+        stats = json.load(open(STATS_FILE)) if os.path.exists(STATS_FILE) else {}
+        uid_s = str(uid)
+        if uid_s not in stats:
+            stats[uid_s] = {
+                "first_seen": datetime.now().isoformat(),
+                "name"      : name,
+                "swaps"     : 0,
+                "last_seen" : datetime.now().isoformat(),
+            }
+        else:
+            stats[uid_s]["last_seen"] = datetime.now().isoformat()
+            if name: stats[uid_s]["name"] = name
+        json.dump(stats, open(STATS_FILE,"w"))
+    except Exception: pass
+
+def get_stats():
+    """Get bot statistics for admin."""
+    try:
+        stats  = json.load(open(STATS_FILE)) if os.path.exists(STATS_FILE) else {}
+        hist   = json.load(open(HISTORY_FILE)) if os.path.exists(HISTORY_FILE) else {}
+        now    = time.time()
+        total  = len(stats)
+        active_24h = sum(
+            1 for u in stats.values()
+            if (datetime.now() - datetime.fromisoformat(
+                u.get("last_seen", "2000-01-01"))).days < 1
+        )
+        # Count total swaps across all users
+        total_swaps = sum(len(v) for v in hist.values())
+        # Active wallets (has keypair)
+        with_wallet = sum(1 for uu in _users.values() if uu.get("keypair"))
+        return {
+            "total"       : total,
+            "active_24h"  : active_24h,
+            "with_wallet" : with_wallet,
+            "total_swaps" : total_swaps,
+            "users"       : stats,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 # Token name cache — fetched from DexScreener
 _tok_name_cache = {}  # mint → {"sym":..., "name":...}
@@ -220,20 +272,73 @@ def sol_usd():
         return float(r.json()["solana"]["usd"])
     except: return 0.0
 
+def simulate_tx(raw_b64):
+    """
+    Simulate TX BEFORE sending — costs ZERO gas.
+    Returns None if OK, raises RuntimeError with reason if would fail.
+    This saves users money on failed transactions!
+    """
+    try:
+        result = rpc("simulateTransaction", [raw_b64, {
+            "encoding"              : "base64",
+            "commitment"            : "processed",
+            "replaceRecentBlockhash": True,  # use fresh blockhash for simulation
+        }])
+        sim = result.get("result", {}).get("value", {})
+        err = sim.get("err")
+        if err:
+            err_s = str(err)
+            # Custom:1 = slippage error
+            if "Custom" in err_s and "1}" in err_s:
+                raise RuntimeError(f"SLIPPAGE_TOO_LOW:{err_s}")
+            # InsufficientFunds
+            if "InsufficientFunds" in err_s or "0x1" in err_s:
+                raise RuntimeError("Insufficient SOL balance for this swap")
+            raise RuntimeError(f"Simulation failed: {err_s[:100]}")
+        return None  # simulation passed — safe to send
+    except RuntimeError:
+        raise
+    except Exception as e:
+        # Simulation itself errored — proceed anyway (don't block)
+        return None
+
+
 def sign_and_send(tx_bytes, kp):
     for attempt in range(3):
         try:
-            raw_tx = VersionedTransaction.from_bytes(tx_bytes)
-            signed = VersionedTransaction(raw_tx.message, [kp])
+            raw_tx  = VersionedTransaction.from_bytes(tx_bytes)
+            signed  = VersionedTransaction(raw_tx.message, [kp])
             raw_b64 = base64.b64encode(bytes(signed)).decode()
-            result = rpc("sendTransaction",[raw_b64,{
-                "encoding":"base64","skipPreflight":True,
-                "preflightCommitment":"processed","maxRetries":5}])
-            if "error" in result: raise RuntimeError(f"RPC: {result['error']}")
+
+            # ── SIMULATE FIRST (zero cost) ──────────────────
+            # If simulation fails → don't send → save gas fee!
+            try:
+                simulate_tx(raw_b64)
+            except RuntimeError as sim_err:
+                sim_s = str(sim_err)
+                if "SLIPPAGE_TOO_LOW" in sim_s:
+                    raise RuntimeError(sim_s)  # signal to retry with higher slippage
+                if "Insufficient" in sim_s:
+                    raise RuntimeError(sim_s)  # hard fail
+                # Other sim errors → try sending anyway
+                logging.warning(f"Simulation warning (sending anyway): {sim_s[:60]}")
+
+            # ── SEND ─────────────────────────────────────────
+            result = rpc("sendTransaction", [raw_b64, {
+                "encoding"           : "base64",
+                "skipPreflight"      : True,   # already simulated above
+                "preflightCommitment": "processed",
+                "maxRetries"         : 5,
+            }])
+            if "error" in result:
+                raise RuntimeError(f"RPC: {result['error']}")
             return result["result"]
-        except RuntimeError: raise
+
+        except RuntimeError:
+            raise
         except Exception as e:
-            if attempt<2: time.sleep(1); continue
+            if attempt < 2:
+                time.sleep(1); continue
             raise RuntimeError(f"Sign failed: {e}")
 
 def confirm_tx(txid, max_wait=45):
@@ -244,7 +349,12 @@ def confirm_tx(txid, max_wait=45):
             res=rpc("getSignatureStatuses",[[txid],{"searchTransactionHistory":True}])
             val=res["result"]["value"][0]
             if val is None: continue
-            if val.get("err"): raise RuntimeError(f"TX failed: {val['err']}")
+            if val.get("err"):
+                err = val["err"]
+                err_s = str(err)
+                if "Custom" in err_s and "1}" in err_s:
+                    raise RuntimeError(f"SLIPPAGE_TOO_LOW:{err_s}")
+                raise RuntimeError(f"TX failed: {err_s}")
             if val.get("confirmationStatus") in ("confirmed","finalized"): return True
         except RuntimeError: raise
         except: pass
@@ -252,19 +362,25 @@ def confirm_tx(txid, max_wait=45):
 
 def get_slippage_steps(mint, fm, user_max_bps=None):
     """
-    Smart slippage ladder starting from 0.1%.
-    Escalates automatically until TX succeeds or max is reached.
-    If user sets custom max, respects it.
+    Dynamic slippage based on token age + type.
+    New tokens (4-24h): higher slippage needed.
+    Older tokens: lower slippage is safer.
     """
     m = (mint or "").lower()
     f = (fm   or "").lower()
 
+    # Pump.fun tokens
     if m.endswith("pump") or f.endswith("pump"):
-        # Pump.fun tokens need higher slippage
-        steps = [100, 200, 500, 1000, 1500, 2000, 2500, 3000]
+        steps = [200, 500, 1000, 1500, 2000, 2500, 3000]
     else:
-        # Normal tokens: start gentle, escalate
-        steps = [10, 50, 100, 200, 300, 500, 1000, 1500]
+        # Check token age for dynamic slippage
+        age_h = get_token_age_hours(mint)
+        if age_h is not None and 4 <= age_h < 24:
+            # New token (4-24h): use 5% base
+            steps = [500, 1000, 1500, 2000, 2500]
+        else:
+            # Older token (>24h): use 3% base
+            steps = [300, 500, 1000, 1500]
 
     # Respect user's custom max slippage setting
     if user_max_bps:
@@ -389,6 +505,91 @@ def token_info(mint):
         res["risk"]="HIGH" if any("🚨" in x for x in w) else "MEDIUM" if w else "LOW"
     except: pass
     return res
+
+def get_token_age_hours(mint):
+    """
+    Get token age in hours from DexScreener pairCreatedAt.
+    Returns float hours, or None if unknown.
+    """
+    try:
+        r = requests.get(DEX_URL.format(mint), timeout=8)
+        if r.status_code != 200: return None
+        pairs = r.json().get("pairs") or []
+        if not pairs: return None
+        # Sort by creation time ascending — get oldest pair
+        times = []
+        for p in pairs:
+            created = p.get("pairCreatedAt")  # unix ms
+            if created:
+                times.append(int(created))
+        if not times: return None
+        oldest_ms = min(times)
+        age_hours = (time.time()*1000 - oldest_ms) / 3_600_000
+        return round(age_hours, 2)
+    except Exception:
+        return None
+
+
+def safe_mode_check(mint, fm, raw_in):
+    """
+    Pre-swap safety validation. Returns (ok, reason).
+    ok=True  → safe to swap
+    ok=False → blocked, reason is user-facing message
+    """
+    # ── 1. Token age check ───────────────────────────────
+    age_h = get_token_age_hours(mint)
+    if age_h is not None and age_h < 4:
+        return False, (
+            f"⚠️ *Token is very new* ({age_h:.1f} hrs old)\n\n"
+            "High risk of failed transactions and gas loss on new tokens.\n\n"
+            "Options:\n"
+            "• 🎯 Use *Sniper Bot* for early entry (no gas waste)\n"
+            "• ⏳ Wait until token is >4 hours old\n"
+            "• ⚠️ Proceed anyway at your own risk"
+        )
+
+    # ── 2. Liquidity + route check via Jupiter quote ─────
+    try:
+        r = requests.get(JUPITER_PAIRS[0]["q"], params={
+            "inputMint"  : fm,
+            "outputMint" : mint,
+            "amount"     : raw_in,
+            "slippageBps": 500,
+        }, timeout=10)
+        if r.status_code != 200:
+            return False, "❌ Could not fetch quote — Jupiter may be down."
+        q = r.json()
+
+        if "error" in q or "errorCode" in q:
+            err = q.get("error", q.get("errorCode",""))
+            return False, f"❌ No route found: `{str(err)[:80]}`"
+
+        out_amt = int(q.get("outAmount", 0))
+        if out_amt == 0:
+            return False, "❌ *No liquidity or route found* for this token.\nTry again later or check DexScreener."
+
+        route = q.get("routePlan", [])
+        if not route:
+            return False, "❌ *No valid swap route* exists for this token."
+
+        # ── 3. Price impact check ────────────────────────
+        impact_pct = float(q.get("priceImpactPct", 0)) * 100
+        if impact_pct > 10:
+            return False, (
+                f"⚠️ *High price impact: {impact_pct:.1f}%*\n\n"
+                "This means your trade will move the price significantly "
+                "and you will receive much less than expected.\n\n"
+                "Reasons:\n• Very low liquidity pool\n• Trade size too large\n\n"
+                "Try a smaller amount or find a more liquid token."
+            )
+
+    except Exception as e:
+        # If we can't check — warn but allow
+        logging.warning(f"safe_mode_check error: {e}")
+        return True, ""
+
+    return True, ""  # all checks passed
+
 
 def fmt_card(info):
     r_ic={"LOW":"✅","MEDIUM":"⚠️","HIGH":"🚨","UNKNOWN":"❓"}.get(info["risk"],"❓")
@@ -783,6 +984,7 @@ def eor(call,text,kb=None):
 @bot.message_handler(commands=["start"])
 def cmd_start(msg):
     uid=msg.from_user.id; usr=u(uid); name=msg.from_user.first_name or "Trader"
+    track_user(uid, msg.from_user.first_name or "")
     # Remove any old reply keyboard that may be persisting
     bot.send_message(msg.chat.id, "⚡",
         reply_markup=types.ReplyKeyboardRemove())
@@ -980,24 +1182,59 @@ def _exec_buy(uid,chat_id,mint,sol_amount):
     ata_usd    = ata_sol * sp
     total_fee  = gas_sol + proto_sol + ata_sol
 
-    sent=bot.send_message(chat_id,
-        f"📊 *Fee Preview*\n\n"
-        f"💰 Swap: `{sol_amount} SOL`\n\n"
-        f"📋 *Estimated Fees:*\n"
-        f"  ⛽ Network gas: `{gas_sol:.6f} SOL` (~${gas_usd:.4f})\n"
-        f"  🔄 Protocol (0.3%): `{proto_sol:.6f} SOL` (~${proto_usd:.4f})\n"
-        + (f"  🏦 ATA rent (first time): `{ata_sol:.6f} SOL` (~${ata_usd:.3f})\n" if ata_sol>0 else "")
-        + f"  ─────────────\n"
-        f"  💸 Total fees: `{total_fee:.6f} SOL` (~${total_fee*sp:.3f})\n\n"
-        f"⏳ _Executing swap…_",
-        parse_mode="Markdown")
+    # ── SAFE MODE: check BEFORE spending any gas ────────
+    checking_msg = bot.send_message(chat_id,
+        "🔍 *Checking token safety…*", parse_mode="Markdown")
 
+    def _run_safety():
+        raw_in = int(sol_amount * 1e9)
+        ok, reason = safe_mode_check(mint, SOL_MINT, raw_in)
+        if not ok:
+            k = types.InlineKeyboardMarkup(row_width=1)
+            age_h = get_token_age_hours(mint)
+            if age_h is not None and age_h < 4:
+                k.add(types.InlineKeyboardButton(
+                    "🎯 Use Sniper Bot (safer)", callback_data=f"sniper_arm"))
+            k.add(types.InlineKeyboardButton(
+                f"⚠️ Proceed anyway (risky)", callback_data=f"force_buy_{mint}_{sol_amount}"))
+            k.add(types.InlineKeyboardButton("🔙 Cancel", callback_data="menu_main"))
+            for i in range(3):
+                try:
+                    bot.edit_message_text(reason, chat_id, checking_msg.message_id,
+                        parse_mode="Markdown", reply_markup=k); break
+                except Exception:
+                    if i<2: time.sleep(1)
+            return
+        # Passed — show fee preview inline then execute
+        try:
+            bot.edit_message_text(
+                f"📊 *Fee Preview*\n\n"
+                f"💰 Swap: `{sol_amount} SOL`\n\n"
+                f"📋 *Estimated Fees:*\n"
+                f"  ⛽ Gas: `{gas_sol:.6f} SOL` (~${gas_usd:.4f})\n"
+                f"  🔄 Protocol 0.3%: `{proto_sol:.6f} SOL` (~${proto_usd:.4f})\n"
+                + (f"  🏦 ATA rent: `{ata_sol:.6f} SOL` (~${ata_usd:.3f})\n" if ata_sol>0 else "")
+                + "  ─────────────\n"
+                f"  💸 Total: `{total_fee:.6f} SOL` (~${total_fee*sp:.3f})\n\n"
+                "✅ _Safety checks passed — signing…_",
+                chat_id, checking_msg.message_id, parse_mode="Markdown")
+        except Exception: pass
+        _exec_buy_final(uid, chat_id, mint, sol_amount, checking_msg.message_id,
+            gas_sol, gas_usd, proto_sol, proto_usd, ata_sol, ata_usd, total_fee, sp)
+
+    threading.Thread(target=_run_safety, daemon=True).start()
+
+
+def _exec_buy_final(uid, chat_id, mint, sol_amount, msg_id,
+        gas_sol, gas_usd, proto_sol, proto_usd, ata_sol, ata_usd, total_fee, sp):
+    """Execute swap after all safety checks passed."""
+    sent_mid = msg_id
     def _r():
         try:
             kp=_users[uid]["keypair"]
             try: bot.edit_message_text(
                 f"📊 *Fee Preview*\n✅ _Fees accepted — signing…_",
-                chat_id,sent.message_id,parse_mode="Markdown")
+                chat_id,sent_mid,parse_mode="Markdown")
             except: pass
 
             txid,out,gasless=do_swap(kp,SOL_MINT,mint,int(sol_amount*1e9))
@@ -1026,7 +1263,7 @@ def _exec_buy(uid,chat_id,mint,sol_amount):
 
             for i in range(3):
                 try:
-                    bot.edit_message_text(msg_text,chat_id,sent.message_id,
+                    bot.edit_message_text(msg_text,chat_id,sent_mid,
                         parse_mode="Markdown",reply_markup=kb_back()); break
                 except Exception:
                     if i<2: time.sleep(2)
@@ -1045,7 +1282,7 @@ def _exec_buy(uid,chat_id,mint,sol_amount):
         except Exception as e:
             for i in range(3):
                 try: bot.edit_message_text(f"❌ *Buy Failed*\n\n`{str(e)[:300]}`",
-                    chat_id,sent.message_id,parse_mode="Markdown",reply_markup=kb_back()); break
+                    chat_id,sent_mid,parse_mode="Markdown",reply_markup=kb_back()); break
                 except Exception:
                     if i<2: time.sleep(2)
     threading.Thread(target=_r,daemon=True).start()
@@ -1302,6 +1539,30 @@ def handle_cb(call):
     elif data=="share_noop":
         bot.answer_callback_query(call.id, "Share this image with friends! 📤")
 
+    elif data.startswith("force_buy_"):
+        # User chose to proceed despite safety warning
+        parts = data.split("_", 3)  # force, buy, mint, amount
+        if len(parts) >= 4:
+            mint      = parts[2]
+            try: sol_amount = float(parts[3])
+            except: sol_amount = 0.01
+            bot.answer_callback_query(call.id, "⚠️ Proceeding at your risk…")
+            # Skip safety checks and execute directly
+            pub       = active_pub(uid) or ""
+            sp        = sol_usd() or 0
+            gas_sol   = 0.000005
+            proto_sol = sol_amount * 0.003
+            user_toks = token_accs(pub) if pub else []
+            has_ata   = any(t["mint"]==mint for t in user_toks)
+            ata_sol   = 0.0 if has_ata else 0.00203928
+            total_fee = gas_sol + proto_sol + ata_sol
+            sent = bot.send_message(call.message.chat.id,
+                "⚠️ *Bypassing safety checks…*\n_Executing swap…_",
+                parse_mode="Markdown")
+            _exec_buy_final(uid, call.message.chat.id, mint, sol_amount, sent.message_id,
+                gas_sol, gas_sol*sp, proto_sol, proto_sol*sp,
+                ata_sol, ata_sol*sp, total_fee, sp)
+
     elif data=="menu_feedback":
         usr["state"]="awaiting_feedback"
         eor(call,"💬 *Send Feedback*\n\nWhat do you think? Bugs or suggestions?\n\n_Type your message:_",kb=kb_back())
@@ -1313,6 +1574,111 @@ def handle_cb(call):
             "4️⃣ *Auto-Trader*\n   🤖 Auto → Start → paste contract\n\n"
             "5️⃣ *Sniper*\n   🎯 Sniper → Arm → paste contract\n\n"
             "⚡ *Gas: ~$0.009* vs $0.40 elsewhere",kb=kb_back())
+
+@bot.message_handler(commands=["admin"])
+def cmd_admin(msg):
+    """Admin dashboard — only for ADMIN_ID."""
+    uid = msg.from_user.id
+    if ADMIN_ID and uid != ADMIN_ID:
+        bot.reply_to(msg, "❌ Admin only."); return
+    elif not ADMIN_ID:
+        bot.reply_to(msg, "❌ Set ADMIN_ID first."); return
+
+    stats = get_stats()
+    if "error" in stats:
+        bot.reply_to(msg, f"❌ Stats error: {stats['error']}"); return
+
+    # Recent users
+    users_sorted = sorted(
+        stats.get("users",{}).items(),
+        key=lambda x: x[1].get("last_seen",""),
+        reverse=True
+    )
+    recent_lines = []
+    for uid_s, info in users_sorted[:10]:
+        name = info.get("name","?")
+        last = info.get("last_seen","")[:10]
+        recent_lines.append(f"  • {name} ({uid_s[:8]}…) — {last}")
+
+    text = (
+        "📊 *MUB DEX Admin Dashboard*\n\n"
+        f"👥 Total users: *{stats['total']}*\n"
+        f"🟢 Active (24h): *{stats['active_24h']}*\n"
+        f"💼 With wallet: *{stats['with_wallet']}*\n"
+        f"🔄 Total swaps: *{stats['total_swaps']}*\n\n"
+        "👤 *Recent Users:*\n"
+        + ("\n".join(recent_lines) if recent_lines else "_None yet_")
+        + "\n\n_Use /broadcast MESSAGE to message all users_"
+    )
+
+    k = types.InlineKeyboardMarkup(row_width=2)
+    k.add(
+        types.InlineKeyboardButton("📨 Broadcast", callback_data="admin_broadcast"),
+        types.InlineKeyboardButton("📊 Full Stats", callback_data="admin_stats"),
+    )
+    bot.reply_to(msg, text, parse_mode="Markdown", reply_markup=k)
+
+
+@bot.message_handler(commands=["broadcast"])
+def cmd_broadcast(msg):
+    """Send message to all users — admin only."""
+    uid = msg.from_user.id
+    if ADMIN_ID and uid != ADMIN_ID:
+        bot.reply_to(msg, "❌ Admin only."); return
+    elif not ADMIN_ID:
+        bot.reply_to(msg, "❌ Set ADMIN_ID first."); return
+
+    text = msg.text.replace("/broadcast","",1).strip()
+    if not text:
+        bot.reply_to(msg, "Usage: `/broadcast YOUR MESSAGE`",
+                     parse_mode="Markdown"); return
+
+    try:
+        stats = json.load(open(STATS_FILE)) if os.path.exists(STATS_FILE) else {}
+    except: stats = {}
+
+    sent_count = 0
+    fail_count = 0
+    for uid_s in stats:
+        try:
+            bot.send_message(int(uid_s),
+                f"📢 *Message from MUB DEX*\n\n{text}",
+                parse_mode="Markdown")
+            sent_count += 1
+            time.sleep(0.05)  # rate limit
+        except Exception:
+            fail_count += 1
+
+    bot.reply_to(msg,
+        f"✅ Broadcast sent!\n"
+        f"  Delivered: {sent_count}\n"
+        f"  Failed: {fail_count}")
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("admin_"))
+def handle_admin_cb(call):
+    if call.from_user.id != ADMIN_ID: return
+    bot.answer_callback_query(call.id)
+
+    if call.data == "admin_broadcast":
+        bot.send_message(call.message.chat.id,
+            "Send: `/broadcast YOUR MESSAGE`\n\nAll users will receive it.",
+            parse_mode="Markdown")
+
+    elif call.data == "admin_stats":
+        stats = get_stats()
+        users = stats.get("users", {})
+        lines = [f"📊 *All Users ({len(users)})*\n"]
+        for uid_s, info in sorted(users.items(),
+                key=lambda x: x[1].get("last_seen",""), reverse=True):
+            name = info.get("name","?")
+            fs   = info.get("first_seen","")[:10]
+            ls   = info.get("last_seen","")[:10]
+            lines.append(f"• *{name}* — joined {fs}, last {ls}")
+        bot.send_message(call.message.chat.id,
+            "\n".join(lines[:30]),
+            parse_mode="Markdown")
+
 
 @bot.message_handler(commands=["send"])
 def cmd_send(msg):
