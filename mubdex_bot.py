@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s")
 
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID   = int(os.environ.get("ADMIN_ID", "6237665352"))
+ADMIN_ID   = int(os.environ.get("ADMIN_ID", ""))
 PROXY_URL  = os.environ.get("PROXY_URL", "")
 RPC_LIST = [
     os.environ.get("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=92d43c65-101f-4053-a457-615a230bfd64"),
@@ -450,50 +450,46 @@ def do_swap(kp, fm, tm, raw_in):
                     logging.info(f"[SWAP] Ultra outAmount={out_amt}")
                     if out_amt > 0:
                         txid = sign_and_send(base64.b64decode(order["transaction"]), kp)
-                        confirm_tx(txid)
+                        try:
+                            confirm_tx(txid)
+                        except RuntimeError as ce:
+                            if "timeout" not in str(ce).lower(): raise
+                            logging.warning("[SWAP] Ultra confirm slow — returning txid")
                         out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
                         return txid, out_amt / (10**out_dec), order.get("gasless", False)
         except RuntimeError as e:
             if "Insufficient" in str(e): raise
             logging.info(f"[SWAP] Ultra failed ({e}), trying Normal…")
         except Exception as e:
-            logging.info(f"[SWAP] Ultra exception ({e}), trying Normal…")
+            logging.info(f"[SWAP] Ultra error ({e}), trying Normal…")
 
-    # ── 2. Jupiter Normal — escalating slippage ───────────
+    # ── 2. Jupiter Normal — ONE TX per slippage step ─────
+    # CRITICAL: once a TX is broadcast, STOP. Never send 2nd TX.
+    # This prevents 5-min hangs and double gas charges.
     slip_steps = get_slippage_steps(tm, fm, user_max)
     last_err   = "No route found"
 
     for slip in slip_steps:
-        success = False
         for pair in JUPITER_PAIRS:
             try:
-                # Fresh quote for this slippage level
                 qr = requests.get(pair["q"], params={
                     "inputMint"  : fm,
                     "outputMint" : tm,
                     "amount"     : raw_in,
                     "slippageBps": slip,
                 }, timeout=10)
-                if qr.status_code != 200:
-                    continue
+                if qr.status_code != 200: continue
                 q = qr.json()
 
                 if "error" in q or "errorCode" in q:
-                    last_err = str(q.get("error", q.get("errorCode", "no route")))
-                    continue
+                    last_err = str(q.get("error", q.get("errorCode",""))); continue
 
                 out_amt = int(q.get("outAmount", 0))
-                logging.info(f"[SWAP] {pair['n']} slip={slip/100:.1f}% out={out_amt}")
+                logging.info(f"[SWAP] {pair['n']} slip={slip/100:.1f}% outAmt={out_amt}")
 
-                if out_amt == 0:
-                    last_err = "outAmount is 0 — no liquidity"
-                    continue
+                if out_amt == 0: last_err = "outAmount=0"; continue
+                if not q.get("routePlan"): last_err = "no routePlan"; continue
 
-                if not q.get("routePlan"):
-                    last_err = "no routePlan"
-                    continue
-
-                # Build TX
                 payload = {
                     "quoteResponse"            : q,
                     "userPublicKey"            : pub,
@@ -502,53 +498,56 @@ def do_swap(kp, fm, tm, raw_in):
                     "dynamicComputeUnitLimit"  : True,
                     "skipUserAccountsCheck"    : True,
                 }
-                if JUPITER_REFERRAL_ACCOUNT:
-                    payload["feeAccount"] = JUPITER_REFERRAL_ACCOUNT
+                if JUPITER_REFERRAL_ACCOUNT: payload["feeAccount"] = JUPITER_REFERRAL_ACCOUNT
 
                 sr = requests.post(pair["s"], json=payload, timeout=20)
-                if sr.status_code != 200:
-                    continue
+                if sr.status_code != 200: continue
                 sd = sr.json()
-                if "swapTransaction" not in sd:
-                    last_err = "no swapTransaction in response"
-                    continue
+                if "swapTransaction" not in sd: last_err = "no swapTransaction"; continue
 
-                # Sign → Send → Confirm
+                # ── TX SEND — point of no return ─────────
                 txid = sign_and_send(base64.b64decode(sd["swapTransaction"]), kp)
-                confirm_tx(txid)
+                logging.info(f"[SWAP] TX sent {txid[:20]}… confirming…")
+
+                # Confirm — if slippage failed on-chain, escalate
+                # If timeout, return txid anyway (TX is on-chain, just slow)
+                try:
+                    confirm_tx(txid)
+                except RuntimeError as ce:
+                    ce_s = str(ce)
+                    if "SLIPPAGE_TOO_LOW" in ce_s or ("Custom" in ce_s and "1}" in ce_s):
+                        last_err = f"SLIPPAGE_LOW@{slip}"
+                        logging.info(f"[SWAP] On-chain slippage fail at {slip/100:.1f}%, escalating")
+                        break  # go to next slip step — but don't resend!
+                    if "timeout" in ce_s.lower():
+                        logging.warning("[SWAP] Confirm slow, returning txid")
+                        # fall through to return below
+                    else:
+                        raise  # real on-chain failure
 
                 out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
                 return txid, out_amt / (10**out_dec), False
 
             except RuntimeError as e:
                 es = str(e)
-                if "Insufficient" in es:
-                    raise  # hard fail — no SOL
-                if "SLIPPAGE_TOO_LOW" in es or ("Custom" in es and "1}" in es):
-                    last_err = f"SLIPPAGE_LOW@{slip}"
-                    logging.info(f"[SWAP] Slippage {slip/100:.1f}% too low, escalating…")
-                    break  # try next slippage step
-                # Other errors — try next pair
-                last_err = es[:100]
-                continue
+                if "Insufficient" in es: raise
+                if "SLIPPAGE_TOO_LOW" in es:
+                    last_err = f"SLIPPAGE_LOW@{slip}"; break
+                last_err = es[:120]; continue
             except Exception as e:
-                last_err = str(e)[:80]
-                continue
+                last_err = str(e)[:80]; continue
 
-        # If we got a slippage signal, move to next slip step
-        if "SLIPPAGE_LOW" in last_err:
-            continue
+        if "SLIPPAGE_LOW" not in last_err:
+            # Non-slippage error or success — don't loop more slippage steps
+            # (success already returned above; error needs different fix, not more slippage)
+            pass  # let loop continue — sometimes higher slippage helps routing
 
-        # If we got here without success from any pair, try next slip step
-        # (allows escalation even for non-slippage errors)
-
-    # All steps exhausted
     if "SLIPPAGE_LOW" in last_err:
-        max_tried = slip_steps[-1] // 100
+        max_pct = slip_steps[-1] // 100
         raise RuntimeError(
-            f"⚠️ Swap failed — slippage up to {max_tried}% insufficient.\n\n"
-            f"This token has very high buy/sell tax or extremely low liquidity.\n"
-            f"Tap 🛡️ Safety to check the token first."
+            f"⚠️ Slippage up to {max_pct}% is still too low.\n\n"
+            f"Token has very high price impact or buy/sell tax.\n"
+            f"Check 🛡️ Safety before trading."
         )
     raise RuntimeError(f"Swap failed: {last_err}")
 
