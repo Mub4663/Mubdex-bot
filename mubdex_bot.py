@@ -332,8 +332,10 @@ def simulate_tx(raw_b64):
 
 def sign_and_send(tx_bytes, kp):
     """
-    Sign → Simulate (free) → Send via PRIMARY RPC → return txid.
-    Retries up to 3 times with 1s delay.
+    Sign → Send → return txid.
+    NO simulation here — simulation caused false blocking of valid swaps.
+    Pre-trade safety is handled by safe_mode_check before this is called.
+    Retries up to 3 times with 1s delay on network errors only.
     """
     for attempt in range(3):
         try:
@@ -341,41 +343,31 @@ def sign_and_send(tx_bytes, kp):
             signed  = VersionedTransaction(raw_tx.message, [kp])
             raw_b64 = base64.b64encode(bytes(signed)).decode()
 
-            # Simulate first — zero cost, saves gas on failure
-            try:
-                simulate_tx(raw_b64)
-            except RuntimeError as sim_err:
-                sim_s = str(sim_err)
-                if "SLIPPAGE_TOO_LOW" in sim_s:
-                    raise  # retry with higher slippage
-                if "Insufficient" in sim_s:
-                    raise  # hard fail — no point retrying
-                # Other sim errors — proceed anyway
-                logging.warning(f"Sim warning on attempt {attempt+1}: {sim_s[:60]}")
-
-            # Send via primary RPC only
-            result = rpc("sendTransaction", [raw_b64, {
+            result  = rpc("sendTransaction", [raw_b64, {
                 "encoding"           : "base64",
                 "skipPreflight"      : True,
                 "preflightCommitment": "processed",
-                "maxRetries"         : 3,
+                "maxRetries"         : 5,
             }], _send=True)
 
             if "error" in result:
                 err_msg = str(result["error"])
+                logging.warning(f"[SEND] Error attempt {attempt+1}: {err_msg[:80]}")
                 if attempt < 2:
-                    logging.warning(f"Send error attempt {attempt+1}: {err_msg[:60]}")
-                    time.sleep(1); continue
-                raise RuntimeError(f"RPC send error: {err_msg[:100]}")
+                    time.sleep(1.5); continue
+                raise RuntimeError(f"RPC error: {err_msg[:120]}")
 
-            return result["result"]  # txid
+            txid = result["result"]
+            logging.info(f"[SEND] TX broadcast: {txid[:20]}…")
+            return txid
 
         except RuntimeError:
             raise
         except Exception as e:
+            logging.warning(f"[SEND] Exception attempt {attempt+1}: {e}")
             if attempt < 2:
-                time.sleep(1); continue
-            raise RuntimeError(f"Sign/send failed after 3 attempts: {e}")
+                time.sleep(1.5); continue
+            raise RuntimeError(f"Failed to send TX after 3 attempts: {e}")
 
 def confirm_tx(txid, max_wait=60):
     """
@@ -408,38 +400,33 @@ def confirm_tx(txid, max_wait=60):
 
 def get_slippage_steps(mint, fm, user_max_bps=None):
     """
-    Dynamic slippage ladder based on token type and age.
-    Stable/liquid: 2-3%   Normal: 3-5%   High-risk: up to 10%
+    Universal slippage ladder — starts low, escalates automatically.
+    Works for all tokens: BONK, WIF, TRUMP, new tokens, pump.fun.
+    Jupiter handles routing; we just need wide enough tolerance.
     """
     m = (mint or "").lower()
-    f = (fm   or "").lower()
 
-    # Pump.fun or known volatile — up to 10%
-    if m.endswith("pump") or f.endswith("pump"):
-        steps = [200, 500, 800, 1000]
+    if m.endswith("pump"):
+        # Pump.fun: start at 1%, up to 20%
+        steps = [100, 300, 500, 1000, 1500, 2000]
     else:
-        age_h = get_token_age_hours(mint)
-        if age_h is not None and age_h < 24:
-            # New token (0-24h) — 5% base, up to 10%
-            steps = [500, 800, 1000]
-        else:
-            # Normal / older token — 3% base, up to 5%
-            steps = [300, 500]
+        # ALL other tokens: start at 0.5%, up to 15%
+        # This covers BONK, WIF, TRUMP, USDT and new tokens equally
+        steps = [50, 100, 200, 500, 1000, 1500]
 
     if user_max_bps:
-        steps = [s for s in steps if s <= user_max_bps] or [user_max_bps]
+        filtered = [s for s in steps if s <= user_max_bps]
+        steps = filtered if filtered else [user_max_bps]
     return steps
 
 def do_swap(kp, fm, tm, raw_in):
     """
-    Clean 10-step execution:
-    1.Quote  2.Validate  3.Build TX  4.Simulate  5.Sign
-    6.Send   7.Confirm   8.Return txid
-    Only returns AFTER on-chain confirmation.
+    Swap engine. Tries Ultra first, then Jupiter Normal with slippage ladder.
+    Returns (txid, out_ui, gasless) only after on-chain confirmation.
     """
     pub = str(kp.pubkey())
 
-    # Detect user engine preference
+    # User engine preference
     use_ultra = True
     user_max  = None
     for uu in _users.values():
@@ -448,7 +435,7 @@ def do_swap(kp, fm, tm, raw_in):
             user_max  = uu.get("settings", {}).get("max_slippage", None)
             break
 
-    # ── Step 1: Try Jupiter Ultra ────────────────────────
+    # ── 1. Jupiter Ultra ─────────────────────────────────
     if use_ultra:
         try:
             params = {"inputMint":fm,"outputMint":tm,"amount":raw_in,"taker":pub}
@@ -461,48 +448,52 @@ def do_swap(kp, fm, tm, raw_in):
                 if "transaction" in order and "error" not in order:
                     out_amt = int(order.get("outAmount", 0))
                     logging.info(f"[SWAP] Ultra outAmount={out_amt}")
-                    if out_amt == 0:
-                        raise RuntimeError("No liquidity (Ultra)")
-                    txid = sign_and_send(base64.b64decode(order["transaction"]), kp)
-                    confirm_tx(txid)
-                    out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
-                    return txid, out_amt / (10**out_dec), order.get("gasless", False)
+                    if out_amt > 0:
+                        txid = sign_and_send(base64.b64decode(order["transaction"]), kp)
+                        confirm_tx(txid)
+                        out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
+                        return txid, out_amt / (10**out_dec), order.get("gasless", False)
         except RuntimeError as e:
-            if "No liquidity" in str(e):
-                raise
-            logging.info(f"[SWAP] Ultra failed, trying Normal: {e}")
+            if "Insufficient" in str(e): raise
+            logging.info(f"[SWAP] Ultra failed ({e}), trying Normal…")
         except Exception as e:
-            logging.info(f"[SWAP] Ultra exception: {e}")
+            logging.info(f"[SWAP] Ultra exception ({e}), trying Normal…")
 
-    # ── Step 2: Jupiter Normal — fresh quote each step ───
-    last_err  = "No route found"
+    # ── 2. Jupiter Normal — escalating slippage ───────────
     slip_steps = get_slippage_steps(tm, fm, user_max)
+    last_err   = "No route found"
 
     for slip in slip_steps:
+        success = False
         for pair in JUPITER_PAIRS:
             try:
-                # Fresh quote right before building TX
+                # Fresh quote for this slippage level
                 qr = requests.get(pair["q"], params={
                     "inputMint"  : fm,
                     "outputMint" : tm,
                     "amount"     : raw_in,
                     "slippageBps": slip,
                 }, timeout=10)
-                if qr.status_code != 200: continue
+                if qr.status_code != 200:
+                    continue
                 q = qr.json()
 
                 if "error" in q or "errorCode" in q:
-                    last_err = str(q.get("error", q.get("errorCode",""))); continue
+                    last_err = str(q.get("error", q.get("errorCode", "no route")))
+                    continue
 
                 out_amt = int(q.get("outAmount", 0))
-                logging.info(f"[SWAP] slip={slip/100:.1f}% outAmount={out_amt} via {pair['n']}")
+                logging.info(f"[SWAP] {pair['n']} slip={slip/100:.1f}% out={out_amt}")
 
                 if out_amt == 0:
-                    raise RuntimeError("No liquidity for this token")
-                if not q.get("routePlan"):
-                    last_err = "No route plan"; continue
+                    last_err = "outAmount is 0 — no liquidity"
+                    continue
 
-                # Build transaction
+                if not q.get("routePlan"):
+                    last_err = "no routePlan"
+                    continue
+
+                # Build TX
                 payload = {
                     "quoteResponse"            : q,
                     "userPublicKey"            : pub,
@@ -515,12 +506,14 @@ def do_swap(kp, fm, tm, raw_in):
                     payload["feeAccount"] = JUPITER_REFERRAL_ACCOUNT
 
                 sr = requests.post(pair["s"], json=payload, timeout=20)
-                if sr.status_code != 200: continue
+                if sr.status_code != 200:
+                    continue
                 sd = sr.json()
                 if "swapTransaction" not in sd:
-                    last_err = "No swapTransaction in response"; continue
+                    last_err = "no swapTransaction in response"
+                    continue
 
-                # Sign → Simulate → Send → Confirm
+                # Sign → Send → Confirm
                 txid = sign_and_send(base64.b64decode(sd["swapTransaction"]), kp)
                 confirm_tx(txid)
 
@@ -529,28 +522,33 @@ def do_swap(kp, fm, tm, raw_in):
 
             except RuntimeError as e:
                 es = str(e)
-                if "No liquidity" in es: raise
-                if "SLIPPAGE_TOO_LOW" in es:
-                    last_err = f"SLIPPAGE_LOW:{slip}"
-                    break   # try next (higher) slippage step
-                last_err = es
+                if "Insufficient" in es:
+                    raise  # hard fail — no SOL
+                if "SLIPPAGE_TOO_LOW" in es or ("Custom" in es and "1}" in es):
+                    last_err = f"SLIPPAGE_LOW@{slip}"
+                    logging.info(f"[SWAP] Slippage {slip/100:.1f}% too low, escalating…")
+                    break  # try next slippage step
+                # Other errors — try next pair
+                last_err = es[:100]
                 continue
             except Exception as e:
                 last_err = str(e)[:80]
                 continue
-        else:
-            continue
-        # break from outer for if inner broke (slippage signal)
 
+        # If we got a slippage signal, move to next slip step
+        if "SLIPPAGE_LOW" in last_err:
+            continue
+
+        # If we got here without success from any pair, try next slip step
+        # (allows escalation even for non-slippage errors)
+
+    # All steps exhausted
     if "SLIPPAGE_LOW" in last_err:
-        bps = last_err.split(":")[-1] if ":" in last_err else str(slip_steps[-1])
-        try: bps_int = int(bps)
-        except: bps_int = slip_steps[-1]
+        max_tried = slip_steps[-1] // 100
         raise RuntimeError(
-            f"Swap failed — even {bps_int//100}% slippage is too low.\n"
-            f"Token likely has:\n• Very low liquidity (< $1K)\n"
-            f"• High buy/sell tax\n• Extreme volatility\n\n"
-            f"Use Safety Check before trading this token."
+            f"⚠️ Swap failed — slippage up to {max_tried}% insufficient.\n\n"
+            f"This token has very high buy/sell tax or extremely low liquidity.\n"
+            f"Tap 🛡️ Safety to check the token first."
         )
     raise RuntimeError(f"Swap failed: {last_err}")
 
