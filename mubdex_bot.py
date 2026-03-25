@@ -17,7 +17,12 @@ logging.basicConfig(level=logging.INFO,
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
 ADMIN_ID   = int(os.environ.get("ADMIN_ID", "6237665352"))
 PROXY_URL  = os.environ.get("PROXY_URL", "")
-RPC_URL    = os.environ.get("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=92d43c65-101f-4053-a457-615a230bfd64")
+RPC_LIST = [
+    os.environ.get("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=92d43c65-101f-4053-a457-615a230bfd64"),
+    "https://api.mainnet-beta.solana.com",
+    "https://rpc.ankr.com/solana",
+]
+RPC_URL = RPC_LIST[0]   # primary — updated by failover
 
 JUPITER_REFERRAL_ACCOUNT = "EqwndckH8GvXoWT1vp5nTqD7KbJPzCEGWnC9XrfqW41x"
 JUPITER_FEE_BPS          = 50
@@ -239,9 +244,30 @@ def load_users():
             _users[uid]=uu
     except: pass
 
-def rpc(method,params):
-    r=requests.post(RPC_URL,json={"jsonrpc":"2.0","id":1,"method":method,"params":params},timeout=15)
-    return r.json()
+def rpc(method, params, _send=False):
+    """
+    Multi-RPC with auto-failover.
+    _send=True  → use primary RPC only (Helius) for send/simulate
+    _send=False → try all RPCs in order for reads/confirms
+    """
+    global RPC_URL
+    targets = [RPC_LIST[0]] if _send else RPC_LIST
+    last_err = "No RPC responded"
+    for url in targets:
+        try:
+            r = requests.post(url,
+                json={"jsonrpc":"2.0","id":1,"method":method,"params":params},
+                timeout=10)
+            if r.status_code == 200:
+                data = r.json()
+                # Update primary if a fallback succeeded
+                if url != RPC_LIST[0] and "result" in data:
+                    logging.info(f"RPC failover: using {url}")
+                return data
+        except Exception as e:
+            last_err = str(e)
+            continue
+    raise RuntimeError(f"All RPCs failed: {last_err}")
 
 def sol_bal(pub):
     try: return rpc("getBalance",[pub,{"commitment":"confirmed"}])["result"]["value"]/1e9
@@ -274,204 +300,257 @@ def sol_usd():
 
 def simulate_tx(raw_b64):
     """
-    Simulate TX BEFORE sending — costs ZERO gas.
-    Returns None if OK, raises RuntimeError with reason if would fail.
-    This saves users money on failed transactions!
+    Simulate using PRIMARY RPC only (Helius — most reliable).
+    Returns None=OK, raises RuntimeError on definitive failure.
+    Non-critical errors are logged and allowed through.
     """
     try:
         result = rpc("simulateTransaction", [raw_b64, {
             "encoding"              : "base64",
             "commitment"            : "processed",
-            "replaceRecentBlockhash": True,  # use fresh blockhash for simulation
-        }])
-        sim = result.get("result", {}).get("value", {})
-        err = sim.get("err")
-        if err:
-            err_s = str(err)
-            # Custom:1 = slippage error
-            if "Custom" in err_s and "1}" in err_s:
-                raise RuntimeError(f"SLIPPAGE_TOO_LOW:{err_s}")
-            # InsufficientFunds
-            if "InsufficientFunds" in err_s or "0x1" in err_s:
-                raise RuntimeError("Insufficient SOL balance for this swap")
-            raise RuntimeError(f"Simulation failed: {err_s[:100]}")
-        return None  # simulation passed — safe to send
+            "replaceRecentBlockhash": True,
+        }], _send=True)  # primary RPC only
+        val = result.get("result", {}).get("value", {})
+        err = val.get("err")
+        if not err:
+            return None  # ✅ simulation passed
+        err_s = str(err)
+        logging.warning(f"Simulation error: {err_s}")
+        if "Custom" in err_s and "1}" in err_s:
+            raise RuntimeError(f"SLIPPAGE_TOO_LOW:{err_s}")
+        if "InsufficientFunds" in err_s or "0x1" in err_s:
+            raise RuntimeError("Insufficient SOL balance")
+        # Any other error — log but allow (don't over-block)
+        logging.warning(f"Sim non-critical error, proceeding: {err_s[:80]}")
+        return None
     except RuntimeError:
         raise
     except Exception as e:
-        # Simulation itself errored — proceed anyway (don't block)
+        logging.warning(f"Simulation call failed (proceeding): {e}")
         return None
 
 
 def sign_and_send(tx_bytes, kp):
+    """
+    Sign → Simulate (free) → Send via PRIMARY RPC → return txid.
+    Retries up to 3 times with 1s delay.
+    """
     for attempt in range(3):
         try:
             raw_tx  = VersionedTransaction.from_bytes(tx_bytes)
             signed  = VersionedTransaction(raw_tx.message, [kp])
             raw_b64 = base64.b64encode(bytes(signed)).decode()
 
-            # ── SIMULATE FIRST (zero cost) ──────────────────
-            # If simulation fails → don't send → save gas fee!
+            # Simulate first — zero cost, saves gas on failure
             try:
                 simulate_tx(raw_b64)
             except RuntimeError as sim_err:
                 sim_s = str(sim_err)
                 if "SLIPPAGE_TOO_LOW" in sim_s:
-                    raise RuntimeError(sim_s)  # signal to retry with higher slippage
+                    raise  # retry with higher slippage
                 if "Insufficient" in sim_s:
-                    raise RuntimeError(sim_s)  # hard fail
-                # Other sim errors → try sending anyway
-                logging.warning(f"Simulation warning (sending anyway): {sim_s[:60]}")
+                    raise  # hard fail — no point retrying
+                # Other sim errors — proceed anyway
+                logging.warning(f"Sim warning on attempt {attempt+1}: {sim_s[:60]}")
 
-            # ── SEND ─────────────────────────────────────────
+            # Send via primary RPC only
             result = rpc("sendTransaction", [raw_b64, {
                 "encoding"           : "base64",
-                "skipPreflight"      : True,   # already simulated above
+                "skipPreflight"      : True,
                 "preflightCommitment": "processed",
-                "maxRetries"         : 5,
-            }])
+                "maxRetries"         : 3,
+            }], _send=True)
+
             if "error" in result:
-                raise RuntimeError(f"RPC: {result['error']}")
-            return result["result"]
+                err_msg = str(result["error"])
+                if attempt < 2:
+                    logging.warning(f"Send error attempt {attempt+1}: {err_msg[:60]}")
+                    time.sleep(1); continue
+                raise RuntimeError(f"RPC send error: {err_msg[:100]}")
+
+            return result["result"]  # txid
 
         except RuntimeError:
             raise
         except Exception as e:
             if attempt < 2:
                 time.sleep(1); continue
-            raise RuntimeError(f"Sign failed: {e}")
+            raise RuntimeError(f"Sign/send failed after 3 attempts: {e}")
 
-def confirm_tx(txid, max_wait=45):
-    deadline=time.time()+max_wait
-    while time.time()<deadline:
+def confirm_tx(txid, max_wait=60):
+    """
+    Confirm using ALL RPCs (secondary preferred for reads).
+    Raises RuntimeError on definitive on-chain failure.
+    """
+    deadline = time.time() + max_wait
+    while time.time() < deadline:
         time.sleep(3)
         try:
-            res=rpc("getSignatureStatuses",[[txid],{"searchTransactionHistory":True}])
-            val=res["result"]["value"][0]
-            if val is None: continue
+            res = rpc("getSignatureStatuses",
+                [[txid], {"searchTransactionHistory": True}])
+            val = res["result"]["value"][0]
+            if val is None:
+                continue
             if val.get("err"):
-                err = val["err"]
-                err_s = str(err)
+                err_s = str(val["err"])
                 if "Custom" in err_s and "1}" in err_s:
                     raise RuntimeError(f"SLIPPAGE_TOO_LOW:{err_s}")
-                raise RuntimeError(f"TX failed: {err_s}")
-            if val.get("confirmationStatus") in ("confirmed","finalized"): return True
-        except RuntimeError: raise
-        except: pass
-    raise RuntimeError("Confirmation timeout — check Solscan")
+                raise RuntimeError(f"TX failed on-chain: {err_s}")
+            status = val.get("confirmationStatus","")
+            if status in ("confirmed", "finalized"):
+                logging.info(f"TX confirmed: {txid[:20]}… [{status}]")
+                return True
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+    raise RuntimeError("Confirmation timeout — check Solscan for TX status")
 
 def get_slippage_steps(mint, fm, user_max_bps=None):
     """
-    Dynamic slippage based on token age + type.
-    New tokens (4-24h): higher slippage needed.
-    Older tokens: lower slippage is safer.
+    Dynamic slippage ladder based on token type and age.
+    Stable/liquid: 2-3%   Normal: 3-5%   High-risk: up to 10%
     """
     m = (mint or "").lower()
     f = (fm   or "").lower()
 
-    # Pump.fun tokens
+    # Pump.fun or known volatile — up to 10%
     if m.endswith("pump") or f.endswith("pump"):
-        steps = [200, 500, 1000, 1500, 2000, 2500, 3000]
+        steps = [200, 500, 800, 1000]
     else:
-        # Check token age for dynamic slippage
         age_h = get_token_age_hours(mint)
-        if age_h is not None and 4 <= age_h < 24:
-            # New token (4-24h): use 5% base
-            steps = [500, 1000, 1500, 2000, 2500]
+        if age_h is not None and age_h < 24:
+            # New token (0-24h) — 5% base, up to 10%
+            steps = [500, 800, 1000]
         else:
-            # Older token (>24h): use 3% base
-            steps = [300, 500, 1000, 1500]
+            # Normal / older token — 3% base, up to 5%
+            steps = [300, 500]
 
-    # Respect user's custom max slippage setting
     if user_max_bps:
-        steps = [s for s in steps if s <= user_max_bps]
-        if not steps:
-            steps = [user_max_bps]
+        steps = [s for s in steps if s <= user_max_bps] or [user_max_bps]
     return steps
 
 def do_swap(kp, fm, tm, raw_in):
+    """
+    Clean 10-step execution:
+    1.Quote  2.Validate  3.Build TX  4.Simulate  5.Sign
+    6.Send   7.Confirm   8.Return txid
+    Only returns AFTER on-chain confirmation.
+    """
     pub = str(kp.pubkey())
 
-    # Check user engine preference
+    # Detect user engine preference
     use_ultra = True
-    for uid_s, uu in _users.items():
-        if uu.get("pubkey") == pub or uu.get("view_pub") == pub:
+    user_max  = None
+    for uu in _users.values():
+        if uu.get("pubkey") == pub:
             use_ultra = uu.get("settings", {}).get("swap_engine", "ultra") == "ultra"
+            user_max  = uu.get("settings", {}).get("max_slippage", None)
             break
 
-    # Try Ultra first (if enabled)
-    if not use_ultra:
-        raise Exception("Normal swap selected by user")
-    try:
-        params={"inputMint":fm,"outputMint":tm,"amount":raw_in,"taker":pub}
-        if JUPITER_REFERRAL_ACCOUNT:
-            params["referralAccount"]=JUPITER_REFERRAL_ACCOUNT
-            params["referralFeeBps"]=JUPITER_FEE_BPS
-        r=requests.get(ULTRA_Q,params=params,timeout=10)
-        if r.status_code==200:
-            order=r.json()
-            if "transaction" in order and "error" not in order:
-                out_amt=int(order.get("outAmount",0))
-                if out_amt==0: raise RuntimeError("No liquidity")
-                txid=sign_and_send(base64.b64decode(order["transaction"]),kp)
-                confirm_tx(txid)
-                out_dec=9 if tm==SOL_MINT else tok_dec(tm)
-                return txid, out_amt/(10**out_dec), order.get("gasless",False)
-    except RuntimeError as e:
-        if "No liquidity" in str(e): raise
-    except: pass
+    # ── Step 1: Try Jupiter Ultra ────────────────────────
+    if use_ultra:
+        try:
+            params = {"inputMint":fm,"outputMint":tm,"amount":raw_in,"taker":pub}
+            if JUPITER_REFERRAL_ACCOUNT:
+                params["referralAccount"] = JUPITER_REFERRAL_ACCOUNT
+                params["referralFeeBps"]  = JUPITER_FEE_BPS
+            r = requests.get(ULTRA_Q, params=params, timeout=10)
+            if r.status_code == 200:
+                order = r.json()
+                if "transaction" in order and "error" not in order:
+                    out_amt = int(order.get("outAmount", 0))
+                    logging.info(f"[SWAP] Ultra outAmount={out_amt}")
+                    if out_amt == 0:
+                        raise RuntimeError("No liquidity (Ultra)")
+                    txid = sign_and_send(base64.b64decode(order["transaction"]), kp)
+                    confirm_tx(txid)
+                    out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
+                    return txid, out_amt / (10**out_dec), order.get("gasless", False)
+        except RuntimeError as e:
+            if "No liquidity" in str(e):
+                raise
+            logging.info(f"[SWAP] Ultra failed, trying Normal: {e}")
+        except Exception as e:
+            logging.info(f"[SWAP] Ultra exception: {e}")
 
-    # Jupiter Normal — fresh quote each step
-    last_err="No route"
-    # Get user's max slippage preference if available
-    user_max = None
-    for uid_s, uu in _users.items():
-        if uu.get("pubkey") == pub or uu.get("view_pub") == pub:
-            user_max = uu.get("settings", {}).get("max_slippage", 3000)
-            break
-    slippage_steps = get_slippage_steps(tm, fm, user_max)
-    for slip in slippage_steps:
+    # ── Step 2: Jupiter Normal — fresh quote each step ───
+    last_err  = "No route found"
+    slip_steps = get_slippage_steps(tm, fm, user_max)
+
+    for slip in slip_steps:
         for pair in JUPITER_PAIRS:
             try:
-                qr=requests.get(pair["q"],params={
-                    "inputMint":fm,"outputMint":tm,
-                    "amount":raw_in,"slippageBps":slip},timeout=10)
-                if qr.status_code!=200: continue
-                q=qr.json()
+                # Fresh quote right before building TX
+                qr = requests.get(pair["q"], params={
+                    "inputMint"  : fm,
+                    "outputMint" : tm,
+                    "amount"     : raw_in,
+                    "slippageBps": slip,
+                }, timeout=10)
+                if qr.status_code != 200: continue
+                q = qr.json()
+
                 if "error" in q or "errorCode" in q:
-                    last_err=str(q.get("error",q.get("errorCode",""))); continue
-                if not q.get("outAmount") or int(q["outAmount"])==0:
+                    last_err = str(q.get("error", q.get("errorCode",""))); continue
+
+                out_amt = int(q.get("outAmount", 0))
+                logging.info(f"[SWAP] slip={slip/100:.1f}% outAmount={out_amt} via {pair['n']}")
+
+                if out_amt == 0:
                     raise RuntimeError("No liquidity for this token")
-                payload={
-                    "quoteResponse":q,"userPublicKey":pub,
-                    "wrapAndUnwrapSol":True,"prioritizationFeeLamports":PRIORITY_FEE,
-                    "dynamicComputeUnitLimit":True,"skipUserAccountsCheck":True,
+                if not q.get("routePlan"):
+                    last_err = "No route plan"; continue
+
+                # Build transaction
+                payload = {
+                    "quoteResponse"            : q,
+                    "userPublicKey"            : pub,
+                    "wrapAndUnwrapSol"         : True,
+                    "prioritizationFeeLamports": PRIORITY_FEE,
+                    "dynamicComputeUnitLimit"  : True,
+                    "skipUserAccountsCheck"    : True,
                 }
-                if JUPITER_REFERRAL_ACCOUNT: payload["feeAccount"]=JUPITER_REFERRAL_ACCOUNT
-                sr=requests.post(pair["s"],json=payload,timeout=20)
-                if sr.status_code!=200: continue
-                sd=sr.json()
-                if "swapTransaction" not in sd: last_err="No swapTransaction"; continue
-                txid=sign_and_send(base64.b64decode(sd["swapTransaction"]),kp)
+                if JUPITER_REFERRAL_ACCOUNT:
+                    payload["feeAccount"] = JUPITER_REFERRAL_ACCOUNT
+
+                sr = requests.post(pair["s"], json=payload, timeout=20)
+                if sr.status_code != 200: continue
+                sd = sr.json()
+                if "swapTransaction" not in sd:
+                    last_err = "No swapTransaction in response"; continue
+
+                # Sign → Simulate → Send → Confirm
+                txid = sign_and_send(base64.b64decode(sd["swapTransaction"]), kp)
                 confirm_tx(txid)
-                out_raw=int(q.get("outAmount",0))
-                out_dec=9 if tm==SOL_MINT else tok_dec(tm)
-                return txid, out_raw/(10**out_dec), False
+
+                out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
+                return txid, out_amt / (10**out_dec), False
+
             except RuntimeError as e:
-                es=str(e)
+                es = str(e)
                 if "No liquidity" in es: raise
-                if "Custom" in es and "1}" in es:
-                    last_err=f"SLIPPAGE_LOW:{slip}"; break  # signal to retry higher
-                last_err=es; continue
+                if "SLIPPAGE_TOO_LOW" in es:
+                    last_err = f"SLIPPAGE_LOW:{slip}"
+                    break   # try next (higher) slippage step
+                last_err = es
+                continue
             except Exception as e:
-                last_err=str(e)[:80]; continue
+                last_err = str(e)[:80]
+                continue
+        else:
+            continue
+        # break from outer for if inner broke (slippage signal)
 
     if "SLIPPAGE_LOW" in last_err:
-        bps = last_err.split(":")[-1] if ":" in last_err else "1500"
+        bps = last_err.split(":")[-1] if ":" in last_err else str(slip_steps[-1])
+        try: bps_int = int(bps)
+        except: bps_int = slip_steps[-1]
         raise RuntimeError(
-            f"Token has very high price impact — even {int(bps)//100}% slippage is too low.\n"
-            f"This token may have:\n• Very low liquidity\n• High buy/sell tax\n• Extreme volatility\n\n"
-            f"Try a more liquid token or use Safety Check first."
+            f"Swap failed — even {bps_int//100}% slippage is too low.\n"
+            f"Token likely has:\n• Very low liquidity (< $1K)\n"
+            f"• High buy/sell tax\n• Extreme volatility\n\n"
+            f"Use Safety Check before trading this token."
         )
     raise RuntimeError(f"Swap failed: {last_err}")
 
@@ -497,9 +576,10 @@ def token_info(mint):
                     "buys24":p.get("txns",{}).get("h24",{}).get("buys",0),
                     "sells24":p.get("txns",{}).get("h24",{}).get("sells",0)})
         w=[]
-        if res["liq"]==0: w.append("🚨 Zero liquidity — possible rug!")
-        elif res["liq"]<1000: w.append("🚨 Very low liquidity")
-        elif res["liq"]<5000: w.append("⚠️ Low liquidity")
+        if res["liq"]==0:      w.append("🚨 Zero liquidity — possible rug!")
+        elif res["liq"]<1000:  w.append("🚨 Liquidity $<1K — extreme risk")
+        elif res["liq"]<5000:  w.append("🚨 Liquidity $<5K — very risky")
+        elif res["liq"]<25000: w.append("⚠️ Liquidity $<25K — risky")
         if res["sells24"]==0 and res["buys24"]>10: w.append("⚠️ No sells — possible honeypot!")
         res["warnings"]=w
         res["risk"]="HIGH" if any("🚨" in x for x in w) else "MEDIUM" if w else "LOW"
@@ -532,63 +612,126 @@ def get_token_age_hours(mint):
 
 def safe_mode_check(mint, fm, raw_in):
     """
-    Pre-swap safety validation. Returns (ok, reason).
-    ok=True  → safe to swap
-    ok=False → blocked, reason is user-facing message
+    Pre-swap safety validation.
+    Returns (status, risk_level, message, needs_confirm)
+    status: "ok" | "warn" | "block"
+    ONLY blocks on: outAmount==0, no routePlan, hard simulation fail.
+    Everything else = warn + allow with confirmation.
     """
-    # ── 1. Token age check ───────────────────────────────
-    age_h = get_token_age_hours(mint)
-    if age_h is not None and age_h < 4:
-        return False, (
-            f"⚠️ *Token is very new* ({age_h:.1f} hrs old)\n\n"
-            "High risk of failed transactions and gas loss on new tokens.\n\n"
-            "Options:\n"
-            "• 🎯 Use *Sniper Bot* for early entry (no gas waste)\n"
-            "• ⏳ Wait until token is >4 hours old\n"
-            "• ⚠️ Proceed anyway at your own risk"
-        )
+    warnings  = []
+    risk      = "LOW"
+    age_h     = None
 
-    # ── 2. Liquidity + route check via Jupiter quote ─────
+    # ── 1. Jupiter quote — HARD checks only ─────────────
+    q = None
+    for pair in JUPITER_PAIRS:
+        try:
+            r = requests.get(pair["q"], params={
+                "inputMint"  : fm,
+                "outputMint" : mint,
+                "amount"     : raw_in,
+                "slippageBps": 500,
+            }, timeout=10)
+            if r.status_code == 200:
+                d = r.json()
+                if d.get("outAmount"):
+                    q = d; break
+        except Exception:
+            continue
+
+    if q is None:
+        return "block", "HIGH", (
+            "❌ *Cannot fetch quote*\n\n"
+            "Jupiter may be temporarily unavailable.\n"
+            "Please try again in 30 seconds."
+        ), False
+
+    out_amt = int(q.get("outAmount", 0))
+    if out_amt == 0:
+        return "block", "HIGH", (
+            "❌ *No liquidity or route found*\n\n"
+            "This token cannot be swapped right now.\n"
+            "Check DexScreener for details."
+        ), False
+
+    if not q.get("routePlan"):
+        return "block", "HIGH", (
+            "❌ *No valid swap route*\n\n"
+            "Jupiter cannot find a path for this swap.\n"
+            "Token may not be listed yet."
+        ), False
+
+    # ── 2. Price impact (warn, never block) ─────────────
+    impact_pct = float(q.get("priceImpactPct", 0)) * 100
+    logging.info(f"[SAFE] PriceImpact={impact_pct:.2f}%  OutAmount={out_amt}")
+
+    if impact_pct > 20:
+        risk = "HIGH"
+        warnings.append(f"🔴 Very high price impact: {impact_pct:.1f}%\n"
+                         "  You will receive significantly less than market value")
+    elif impact_pct > 10:
+        risk = "MEDIUM"
+        warnings.append(f"🟡 High price impact: {impact_pct:.1f}%")
+    elif impact_pct > 3:
+        warnings.append(f"🟡 Moderate price impact: {impact_pct:.1f}%")
+
+    # ── 3. Token age (warn + confirm, never block) ───────
     try:
-        r = requests.get(JUPITER_PAIRS[0]["q"], params={
-            "inputMint"  : fm,
-            "outputMint" : mint,
-            "amount"     : raw_in,
-            "slippageBps": 500,
-        }, timeout=10)
-        if r.status_code != 200:
-            return False, "❌ Could not fetch quote — Jupiter may be down."
-        q = r.json()
+        age_h = get_token_age_hours(mint)
+        if age_h is not None:
+            if age_h < 1:
+                risk = "HIGH"
+                warnings.append(f"🔴 Extremely new token ({age_h*60:.0f} min old)\n"
+                                  "  Very high rug pull risk — use Sniper Bot instead")
+            elif age_h < 4:
+                risk = "HIGH"
+                warnings.append(f"🔴 Very new token ({age_h:.1f}h)\n"
+                                  "  High risk of scams / rug pull / honeypot")
+            elif age_h < 24:
+                if risk == "LOW": risk = "MEDIUM"
+                warnings.append(f"🟡 New token ({age_h:.1f}h) — proceed with caution")
+    except Exception:
+        pass
 
-        if "error" in q or "errorCode" in q:
-            err = q.get("error", q.get("errorCode",""))
-            return False, f"❌ No route found: `{str(err)[:80]}`"
+    # ── 4. Liquidity (warn, block only at zero) ──────────
+    try:
+        info = token_info(mint)
+        liq  = info.get("liq", 0)
+        logging.info(f"[SAFE] Liquidity=${liq:,.0f}")
+        if liq == 0:
+            return "block", "HIGH", (
+                "🚨 *Zero liquidity detected*\n\n"
+                "This token has no tradeable liquidity."
+            ), False
+        elif liq < 1000:
+            risk = "HIGH"
+            warnings.append(f"🔴 Extremely low liquidity: ${liq:,.0f}")
+        elif liq < 5000:
+            if risk == "LOW": risk = "MEDIUM"
+            warnings.append(f"🟡 Low liquidity: ${liq:,.0f} (min recommended: $5K)")
+        elif liq < 25000:
+            warnings.append(f"🟡 Moderate liquidity: ${liq:,.0f}")
 
-        out_amt = int(q.get("outAmount", 0))
-        if out_amt == 0:
-            return False, "❌ *No liquidity or route found* for this token.\nTry again later or check DexScreener."
+        # Honeypot signal
+        if info.get("sells24", 0) == 0 and info.get("buys24", 0) > 20:
+            risk = "HIGH"
+            warnings.append("🔴 Possible HONEYPOT — no sell transactions detected!")
+    except Exception:
+        pass
 
-        route = q.get("routePlan", [])
-        if not route:
-            return False, "❌ *No valid swap route* exists for this token."
+    # ── 5. Result ────────────────────────────────────────
+    if not warnings:
+        return "ok", "LOW", "", False
 
-        # ── 3. Price impact check ────────────────────────
-        impact_pct = float(q.get("priceImpactPct", 0)) * 100
-        if impact_pct > 10:
-            return False, (
-                f"⚠️ *High price impact: {impact_pct:.1f}%*\n\n"
-                "This means your trade will move the price significantly "
-                "and you will receive much less than expected.\n\n"
-                "Reasons:\n• Very low liquidity pool\n• Trade size too large\n\n"
-                "Try a smaller amount or find a more liquid token."
-            )
-
-    except Exception as e:
-        # If we can't check — warn but allow
-        logging.warning(f"safe_mode_check error: {e}")
-        return True, ""
-
-    return True, ""  # all checks passed
+    risk_icon = {"LOW": "✅", "MEDIUM": "⚠️", "HIGH": "🔴"}.get(risk, "❓")
+    warn_text = "\n\n".join(f"  {w}" for w in warnings)
+    msg = (
+        f"{risk_icon} *Risk Level: {risk}*\n\n"
+        f"{warn_text}\n\n"
+        "_Tap ✅ Proceed to swap or ❌ Cancel._"
+    )
+    needs_confirm = risk in ("HIGH", "MEDIUM")
+    return "warn", risk, msg, needs_confirm
 
 
 def fmt_card(info):
@@ -1188,36 +1331,56 @@ def _exec_buy(uid,chat_id,mint,sol_amount):
 
     def _run_safety():
         raw_in = int(sol_amount * 1e9)
-        ok, reason = safe_mode_check(mint, SOL_MINT, raw_in)
-        if not ok:
+        status, risk, msg, needs_confirm = safe_mode_check(mint, SOL_MINT, raw_in)
+
+        # Hard block
+        if status == "block":
             k = types.InlineKeyboardMarkup(row_width=1)
-            age_h = get_token_age_hours(mint)
-            if age_h is not None and age_h < 4:
-                k.add(types.InlineKeyboardButton(
-                    "🎯 Use Sniper Bot (safer)", callback_data=f"sniper_arm"))
-            k.add(types.InlineKeyboardButton(
-                f"⚠️ Proceed anyway (risky)", callback_data=f"force_buy_{mint}_{sol_amount}"))
             k.add(types.InlineKeyboardButton("🔙 Cancel", callback_data="menu_main"))
             for i in range(3):
                 try:
-                    bot.edit_message_text(reason, chat_id, checking_msg.message_id,
+                    bot.edit_message_text(msg, chat_id, checking_msg.message_id,
                         parse_mode="Markdown", reply_markup=k); break
                 except Exception:
-                    if i<2: time.sleep(1)
+                    if i < 2: time.sleep(1)
             return
-        # Passed — show fee preview inline then execute
+
+        # Warning with optional confirmation
+        if status == "warn" and needs_confirm:
+            k = types.InlineKeyboardMarkup(row_width=2)
+            k.add(
+                types.InlineKeyboardButton(
+                    "✅ Proceed", callback_data=f"force_buy_{mint}_{sol_amount}"),
+                types.InlineKeyboardButton(
+                    "❌ Cancel", callback_data="menu_main"),
+            )
+            if risk == "HIGH":
+                k.add(types.InlineKeyboardButton(
+                    "🎯 Use Sniper instead", callback_data="sniper_arm"))
+            for i in range(3):
+                try:
+                    bot.edit_message_text(msg, chat_id, checking_msg.message_id,
+                        parse_mode="Markdown", reply_markup=k); break
+                except Exception:
+                    if i < 2: time.sleep(1)
+            return
+
+        # OK or non-blocking warn — show fee preview + execute
+        risk_icon = {"LOW":"✅","MEDIUM":"⚠️","HIGH":"🔴"}.get(risk,"✅")
+        fee_line  = (
+            f"📊 *Fee Preview*  {risk_icon} Risk: {risk}\n\n"
+            f"💰 Swap: `{sol_amount} SOL`\n\n"
+            f"📋 *Estimated Fees:*\n"
+            f"  ⛽ Gas: `{gas_sol:.6f} SOL` (~${gas_usd:.4f})\n"
+            f"  🔄 Protocol: `{proto_sol:.6f} SOL` (~${proto_usd:.4f})\n"
+            + (f"  🏦 ATA rent: `{ata_sol:.6f} SOL`\n" if ata_sol > 0 else "")
+            + f"  💸 Total: ~${total_fee*sp:.4f}\n"
+            + (f"\n{msg}\n" if msg else "")
+            + "\n_Executing swap…_"
+        )
         try:
-            bot.edit_message_text(
-                f"📊 *Fee Preview*\n\n"
-                f"💰 Swap: `{sol_amount} SOL`\n\n"
-                f"📋 *Estimated Fees:*\n"
-                f"  ⛽ Gas: `{gas_sol:.6f} SOL` (~${gas_usd:.4f})\n"
-                f"  🔄 Protocol 0.3%: `{proto_sol:.6f} SOL` (~${proto_usd:.4f})\n"
-                + (f"  🏦 ATA rent: `{ata_sol:.6f} SOL` (~${ata_usd:.3f})\n" if ata_sol>0 else "")
-                + "  ─────────────\n"
-                f"  💸 Total: `{total_fee:.6f} SOL` (~${total_fee*sp:.3f})\n\n"
-                "✅ _Safety checks passed — signing…_",
-                chat_id, checking_msg.message_id, parse_mode="Markdown")
+            bot.edit_message_text(fee_line, chat_id, checking_msg.message_id,
+                parse_mode="Markdown")
         except Exception: pass
         _exec_buy_final(uid, chat_id, mint, sol_amount, checking_msg.message_id,
             gas_sol, gas_usd, proto_sol, proto_usd, ata_sol, ata_usd, total_fee, sp)
