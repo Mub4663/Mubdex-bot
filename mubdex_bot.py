@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s")
 
 BOT_TOKEN  = os.environ.get("BOT_TOKEN", "")
-ADMIN_ID   = int(os.environ.get("ADMIN_ID", ""))
+ADMIN_ID   = int(os.environ.get("ADMIN_ID", "6237665352"))
 PROXY_URL  = os.environ.get("PROXY_URL", "")
 RPC_LIST = [
     os.environ.get("RPC_URL", "https://mainnet.helius-rpc.com/?api-key=92d43c65-101f-4053-a457-615a230bfd64"),
@@ -369,34 +369,42 @@ def sign_and_send(tx_bytes, kp):
                 time.sleep(1.5); continue
             raise RuntimeError(f"Failed to send TX after 3 attempts: {e}")
 
-def confirm_tx(txid, max_wait=60):
+def confirm_tx(txid, max_wait=90):
     """
-    Confirm using ALL RPCs (secondary preferred for reads).
-    Raises RuntimeError on definitive on-chain failure.
+    Wait for on-chain confirmation. Uses all RPCs.
+    Raises RuntimeError immediately on ANY on-chain failure — no fake success.
     """
     deadline = time.time() + max_wait
     while time.time() < deadline:
-        time.sleep(3)
+        time.sleep(2)
         try:
             res = rpc("getSignatureStatuses",
                 [[txid], {"searchTransactionHistory": True}])
-            val = res["result"]["value"][0]
+            val = res.get("result", {}).get("value", [None])[0]
             if val is None:
                 continue
+
+            # On-chain error — raise IMMEDIATELY, never return success
             if val.get("err"):
                 err_s = str(val["err"])
+                logging.warning(f"[CONFIRM] TX failed on-chain: {err_s}")
                 if "Custom" in err_s and "1}" in err_s:
-                    raise RuntimeError(f"SLIPPAGE_TOO_LOW:{err_s}")
+                    raise RuntimeError(f"SLIPPAGE_TOO_LOW")
                 raise RuntimeError(f"TX failed on-chain: {err_s}")
-            status = val.get("confirmationStatus","")
+
+            status = val.get("confirmationStatus", "")
             if status in ("confirmed", "finalized"):
-                logging.info(f"TX confirmed: {txid[:20]}… [{status}]")
+                logging.info(f"[CONFIRM] ✅ {txid[:20]}… [{status}]")
                 return True
+            # Still processing — keep waiting
+
         except RuntimeError:
             raise
-        except Exception:
-            pass
-    raise RuntimeError("Confirmation timeout — check Solscan for TX status")
+        except Exception as e:
+            logging.warning(f"[CONFIRM] RPC error: {e}")
+            continue
+
+    raise RuntimeError("Confirmation timeout")
 
 def get_slippage_steps(mint, fm, user_max_bps=None):
     """
@@ -419,6 +427,22 @@ def get_slippage_steps(mint, fm, user_max_bps=None):
         steps = filtered if filtered else [user_max_bps]
     return steps
 
+def estimate_buy_fees(sol_amount, has_ata=False):
+    """Estimate extra SOL needed around a buy before sending a swap."""
+    gas_sol   = 0.000005
+    proto_sol = sol_amount * 0.003
+    ata_sol   = 0.0 if has_ata else 0.00203928
+    reserve   = 0.0005
+    total_fee = gas_sol + proto_sol + ata_sol
+    return {
+        "gas_sol"  : gas_sol,
+        "proto_sol": proto_sol,
+        "ata_sol"  : ata_sol,
+        "reserve"  : reserve,
+        "total_fee": total_fee,
+        "required" : sol_amount + total_fee + reserve,
+    }
+
 def do_swap(kp, fm, tm, raw_in):
     """
     Swap engine. Tries Ultra first, then Jupiter Normal with slippage ladder.
@@ -437,6 +461,7 @@ def do_swap(kp, fm, tm, raw_in):
 
     # ── 1. Jupiter Ultra ─────────────────────────────────
     if use_ultra:
+        ultra_sent = False
         try:
             params = {"inputMint":fm,"outputMint":tm,"amount":raw_in,"taker":pub}
             if JUPITER_REFERRAL_ACCOUNT:
@@ -449,24 +474,26 @@ def do_swap(kp, fm, tm, raw_in):
                     out_amt = int(order.get("outAmount", 0))
                     logging.info(f"[SWAP] Ultra outAmount={out_amt}")
                     if out_amt > 0:
+                        ultra_sent = True
                         txid = sign_and_send(base64.b64decode(order["transaction"]), kp)
-                        try:
-                            confirm_tx(txid)
-                        except RuntimeError as ce:
-                            if "timeout" not in str(ce).lower(): raise
-                            logging.warning("[SWAP] Ultra confirm slow — returning txid")
+                        confirm_tx(txid)
                         out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
                         return txid, out_amt / (10**out_dec), order.get("gasless", False)
         except RuntimeError as e:
+            if ultra_sent:
+                raise
             if "Insufficient" in str(e): raise
             logging.info(f"[SWAP] Ultra failed ({e}), trying Normal…")
         except Exception as e:
+            if ultra_sent:
+                raise RuntimeError(f"Ultra swap sent but confirmation failed: {e}")
             logging.info(f"[SWAP] Ultra error ({e}), trying Normal…")
 
     # ── 2. Jupiter Normal — ONE TX per slippage step ─────
     # CRITICAL: once a TX is broadcast, STOP. Never send 2nd TX.
     # This prevents 5-min hangs and double gas charges.
-    slip_steps = get_slippage_steps(tm, fm, user_max)
+    slip_mint  = tm if fm == SOL_MINT else fm
+    slip_steps = get_slippage_steps(slip_mint, fm, user_max)
     last_err   = "No route found"
 
     for slip in slip_steps:
@@ -498,8 +525,6 @@ def do_swap(kp, fm, tm, raw_in):
                     "dynamicComputeUnitLimit"  : True,
                     "skipUserAccountsCheck"    : True,
                 }
-                if JUPITER_REFERRAL_ACCOUNT: payload["feeAccount"] = JUPITER_REFERRAL_ACCOUNT
-
                 sr = requests.post(pair["s"], json=payload, timeout=20)
                 if sr.status_code != 200: continue
                 sd = sr.json()
@@ -509,21 +534,17 @@ def do_swap(kp, fm, tm, raw_in):
                 txid = sign_and_send(base64.b64decode(sd["swapTransaction"]), kp)
                 logging.info(f"[SWAP] TX sent {txid[:20]}… confirming…")
 
-                # Confirm — if slippage failed on-chain, escalate
-                # If timeout, return txid anyway (TX is on-chain, just slow)
+                # Confirm — strict. Only return on real confirmation.
                 try:
                     confirm_tx(txid)
                 except RuntimeError as ce:
                     ce_s = str(ce)
                     if "SLIPPAGE_TOO_LOW" in ce_s or ("Custom" in ce_s and "1}" in ce_s):
                         last_err = f"SLIPPAGE_LOW@{slip}"
-                        logging.info(f"[SWAP] On-chain slippage fail at {slip/100:.1f}%, escalating")
-                        break  # go to next slip step — but don't resend!
-                    if "timeout" in ce_s.lower():
-                        logging.warning("[SWAP] Confirm slow, returning txid")
-                        # fall through to return below
-                    else:
-                        raise  # real on-chain failure
+                        logging.info(f"[SWAP] Slippage {slip/100:.1f}% failed on-chain, escalating…")
+                        break  # next slippage step
+                    # timeout OR real failure — raise so user sees real error
+                    raise
 
                 out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
                 return txid, out_amt / (10**out_dec), False
@@ -1306,146 +1327,92 @@ def _show_token(uid,chat_id,mint):
 def _exec_buy(uid,chat_id,mint,sol_amount):
     if not has_wallet(uid):
         bot.send_message(chat_id,"❌ *No trade wallet.*\n\nTap 💼 Wallet → ⚡ Add Trade Wallet",parse_mode="Markdown",reply_markup=kb_wallet(uid)); return
-    pub=_users[uid]["pubkey"]; bal=sol_bal(pub)
-    if bal<sol_amount+0.002:
-        bot.send_message(chat_id,f"❌ *Insufficient balance*\n\nYou have: `{bal:.4f} SOL`\nNeed: `{sol_amount+0.002:.4f} SOL`",parse_mode="Markdown",reply_markup=kb_back()); return
-    sp        = sol_usd() or 0
-    gas_sol   = 0.000005
-    gas_usd   = gas_sol * sp
-    proto_sol = sol_amount * 0.003
-    proto_usd = proto_sol * sp
-    # Check if first time receiving this token (ATA rent)
-    pub        = _users[uid]["pubkey"]
-    user_toks  = token_accs(pub)
-    has_ata    = any(t["mint"]==mint for t in user_toks)
-    ata_sol    = 0.0 if has_ata else 0.00203928
-    ata_usd    = ata_sol * sp
-    total_fee  = gas_sol + proto_sol + ata_sol
+    pub = _users[uid]["pubkey"]; bal = sol_bal(pub)
+    user_toks = token_accs(pub)
+    has_ata   = any(t["mint"]==mint for t in user_toks)
+    fees      = estimate_buy_fees(sol_amount, has_ata=has_ata)
+    if bal < fees["required"]:
+        bot.send_message(chat_id,
+            f"❌ *Insufficient balance*\n\n"
+            f"Have: `{bal:.4f} SOL`\nNeed: `{fees['required']:.4f} SOL`",
+            parse_mode="Markdown",reply_markup=kb_back()); return
 
-    # ── SAFE MODE: check BEFORE spending any gas ────────
-    checking_msg = bot.send_message(chat_id,
-        "🔍 *Checking token safety…*", parse_mode="Markdown")
+    # ── EXECUTE IMMEDIATELY — no safety delay ────────────
+    # Safety info is already shown when user views token card.
+    # Adding API calls here wastes 20-30s → blockhash expires → TX fails.
+    # This is why Trojan/Banana work and slow bots don't.
+    sent = bot.send_message(chat_id,
+        f"⚡ *Swapping {sol_amount} SOL…*",
+        parse_mode="Markdown")
 
-    def _run_safety():
-        raw_in = int(sol_amount * 1e9)
-        status, risk, msg, needs_confirm = safe_mode_check(mint, SOL_MINT, raw_in)
+    sp        = 0  # fetch inside thread to not block
+    gas_sol   = fees["gas_sol"]
+    proto_sol = fees["proto_sol"]
+    ata_sol   = fees["ata_sol"]
 
-        # Hard block
-        if status == "block":
-            k = types.InlineKeyboardMarkup(row_width=1)
-            k.add(types.InlineKeyboardButton("🔙 Cancel", callback_data="menu_main"))
-            for i in range(3):
-                try:
-                    bot.edit_message_text(msg, chat_id, checking_msg.message_id,
-                        parse_mode="Markdown", reply_markup=k); break
-                except Exception:
-                    if i < 2: time.sleep(1)
-            return
-
-        # Warning with optional confirmation
-        if status == "warn" and needs_confirm:
-            k = types.InlineKeyboardMarkup(row_width=2)
-            k.add(
-                types.InlineKeyboardButton(
-                    "✅ Proceed", callback_data=f"force_buy_{mint}_{sol_amount}"),
-                types.InlineKeyboardButton(
-                    "❌ Cancel", callback_data="menu_main"),
-            )
-            if risk == "HIGH":
-                k.add(types.InlineKeyboardButton(
-                    "🎯 Use Sniper instead", callback_data="sniper_arm"))
-            for i in range(3):
-                try:
-                    bot.edit_message_text(msg, chat_id, checking_msg.message_id,
-                        parse_mode="Markdown", reply_markup=k); break
-                except Exception:
-                    if i < 2: time.sleep(1)
-            return
-
-        # OK or non-blocking warn — show fee preview + execute
-        risk_icon = {"LOW":"✅","MEDIUM":"⚠️","HIGH":"🔴"}.get(risk,"✅")
-        fee_line  = (
-            f"📊 *Fee Preview*  {risk_icon} Risk: {risk}\n\n"
-            f"💰 Swap: `{sol_amount} SOL`\n\n"
-            f"📋 *Estimated Fees:*\n"
-            f"  ⛽ Gas: `{gas_sol:.6f} SOL` (~${gas_usd:.4f})\n"
-            f"  🔄 Protocol: `{proto_sol:.6f} SOL` (~${proto_usd:.4f})\n"
-            + (f"  🏦 ATA rent: `{ata_sol:.6f} SOL`\n" if ata_sol > 0 else "")
-            + f"  💸 Total: ~${total_fee*sp:.4f}\n"
-            + (f"\n{msg}\n" if msg else "")
-            + "\n_Executing swap…_"
-        )
-        try:
-            bot.edit_message_text(fee_line, chat_id, checking_msg.message_id,
-                parse_mode="Markdown")
-        except Exception: pass
-        _exec_buy_final(uid, chat_id, mint, sol_amount, checking_msg.message_id,
-            gas_sol, gas_usd, proto_sol, proto_usd, ata_sol, ata_usd, total_fee, sp)
-
-    threading.Thread(target=_run_safety, daemon=True).start()
+    _exec_buy_final(uid, chat_id, mint, sol_amount, sent.message_id,
+        gas_sol, 0, proto_sol, 0, ata_sol, 0, gas_sol+proto_sol+ata_sol, sp)
 
 
 def _exec_buy_final(uid, chat_id, mint, sol_amount, msg_id,
         gas_sol, gas_usd, proto_sol, proto_usd, ata_sol, ata_usd, total_fee, sp):
-    """Execute swap after all safety checks passed."""
-    sent_mid = msg_id
+    """Execute swap immediately — minimum latency."""
     def _r():
         try:
-            kp=_users[uid]["keypair"]
-            try: bot.edit_message_text(
-                f"📊 *Fee Preview*\n✅ _Fees accepted — signing…_",
-                chat_id,sent_mid,parse_mode="Markdown")
-            except: pass
+            kp = _users[uid]["keypair"]
+            txid, out, gasless = do_swap(kp, SOL_MINT, mint, int(sol_amount*1e9))
+            sym, _ = get_token_name(mint)
+            sp2       = sol_usd() or 0
+            fee_sol   = sol_amount * 0.003
+            fee_usd   = fee_sol * sp2
+            gas_usd2  = gas_sol * sp2
+            ata_usd2  = ata_sol * sp2
 
-            txid,out,gasless=do_swap(kp,SOL_MINT,mint,int(sol_amount*1e9))
-            sym,sname=get_token_name(mint)
-            sp2=sol_usd() or 0
-            fee_sol=sol_amount*0.003; fee_usd=fee_sol*sp2
-
-            # Save to history
-            save_history(uid,{
+            save_history(uid, {
                 "type":"BUY","sym":sym,"mint":mint,
                 "in_sol":sol_amount,"out_tok":out,
-                "fee_sol":total_fee,"gasless":gasless,
-                "txid":txid,"time":datetime.now().isoformat()
+                "fee_sol":gas_sol+fee_sol+ata_sol,
+                "gasless":gasless,"txid":txid,
+                "time":datetime.now().isoformat()
             })
 
             msg_text = (
                 f"✅ *Buy Confirmed!*{'  ⚡ GASLESS!' if gasless else ''}\n\n"
                 f"💰 Spent: `{sol_amount} SOL`\n"
                 f"📥 Got: `{out:.6f} {sym}`\n\n"
-                f"📊 *Actual Fees:*\n"
-                f"  ⛽ Gas: `{'$0.00' if gasless else f'~${gas_usd:.4f}'}`\n"
+                f"📊 *Fees:*\n"
+                f"  ⛽ Gas: `{'~$0.00' if gasless else f'~${gas_usd2:.4f}'}`\n"
                 f"  🔄 Protocol: `{fee_sol:.6f} SOL (~${fee_usd:.4f})`\n"
-                + (f"  🏦 ATA rent: `{ata_sol:.6f} SOL` (one-time)\n" if ata_sol>0 else "")
+                + (f"  🏦 ATA: `{ata_sol:.6f} SOL` (~${ata_usd2:.3f}) one-time\n" if ata_sol>0 else "")
                 + f"\n[🔗 View on Solscan](https://solscan.io/tx/{txid})"
             )
-
             for i in range(3):
                 try:
-                    bot.edit_message_text(msg_text,chat_id,sent_mid,
-                        parse_mode="Markdown",reply_markup=kb_back()); break
+                    bot.edit_message_text(msg_text, chat_id, msg_id,
+                        parse_mode="Markdown", reply_markup=kb_back()); break
                 except Exception:
-                    if i<2: time.sleep(2)
+                    if i < 2: time.sleep(1)
 
-            # Send trade card image
             try:
                 card = generate_trade_card(uid, sym, "BUY", sol_amount, out, txid=txid)
                 if card:
                     k_share = types.InlineKeyboardMarkup()
-                    k_share.add(types.InlineKeyboardButton("📤 Share Result", callback_data=f"share_noop"))
+                    k_share.add(types.InlineKeyboardButton("📤 Share", callback_data="share_noop"))
                     bot.send_photo(chat_id, card,
-                        caption=f"⚡ *MUB DEX Trade* — Bought ${sym}",
+                        caption=f"⚡ *MUB DEX* — Bought ${sym}",
                         parse_mode="Markdown", reply_markup=k_share)
             except Exception: pass
 
         except Exception as e:
             for i in range(3):
-                try: bot.edit_message_text(f"❌ *Buy Failed*\n\n`{str(e)[:300]}`",
-                    chat_id,sent_mid,parse_mode="Markdown",reply_markup=kb_back()); break
+                try:
+                    bot.edit_message_text(
+                        f"❌ *Buy Failed*\n\n`{str(e)[:300]}`",
+                        chat_id, msg_id, parse_mode="Markdown",
+                        reply_markup=kb_back()); break
                 except Exception:
-                    if i<2: time.sleep(2)
-    threading.Thread(target=_r,daemon=True).start()
+                    if i < 2: time.sleep(1)
+    threading.Thread(target=_r, daemon=True).start()
 
 def _exec_sell(uid,chat_id,mint,pct,to_mint=None):
     if to_mint is None: to_mint=SOL_MINT
@@ -1476,7 +1443,7 @@ def _exec_sell(uid,chat_id,mint,pct,to_mint=None):
                     if i<2: time.sleep(2)
     threading.Thread(target=_r,daemon=True).start()
 
-@bot.callback_query_handler(func=lambda c:True)
+@bot.callback_query_handler(func=lambda c: not c.data.startswith("admin_"))
 def handle_cb(call):
     uid=call.from_user.id; data=call.data; usr=u(uid)
     try: bot.answer_callback_query(call.id)
