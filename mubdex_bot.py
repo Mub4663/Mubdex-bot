@@ -168,10 +168,10 @@ _limits  = {}
 def _xor(d, k): return bytes(b ^ k[i%len(k)] for i,b in enumerate(d))
 def _default_settings():
     return {
-        "default_buy" : 0.1,
+        "default_buy" : 0.001,
         "auto_tp"     : 20,
         "auto_sl"     : 10,
-        "max_slippage": 3000,   # bps — 30% default max (auto-escalates from 0.1%)
+        "max_slippage": 5000,   # bps — 30% default max (auto-escalates from 0.1%)
         "swap_engine" : "ultra", # ultra | normal
     }
 
@@ -408,40 +408,18 @@ def confirm_tx(txid, max_wait=90):
 
 def get_slippage_steps(mint, fm, user_max_bps=None):
     """
-    Universal slippage ladder — starts low, escalates automatically.
-    Works for all tokens: BONK, WIF, TRUMP, new tokens, pump.fun.
-    Jupiter handles routing; we just need wide enough tolerance.
+    Slippage ladder. Simulation tests each step for FREE before sending.
+    So we can afford to go wide — failed steps cost zero gas.
     """
     m = (mint or "").lower()
-
     if m.endswith("pump"):
-        # Pump.fun: start at 1%, up to 20%
-        steps = [100, 300, 500, 1000, 1500, 2000]
+        steps = [100, 300, 500, 1000, 1500, 2000, 2500, 3000,4000,5000]
     else:
-        # ALL other tokens: start at 0.5%, up to 15%
-        # This covers BONK, WIF, TRUMP, USDT and new tokens equally
-        steps = [50, 100, 200, 500, 1000, 1500]
-
+        steps = [50, 100, 300, 500, 1000, 1500, 2000, 3000]
     if user_max_bps:
         filtered = [s for s in steps if s <= user_max_bps]
         steps = filtered if filtered else [user_max_bps]
     return steps
-
-def estimate_buy_fees(sol_amount, has_ata=False):
-    """Estimate extra SOL needed around a buy before sending a swap."""
-    gas_sol   = 0.000005
-    proto_sol = sol_amount * 0.003
-    ata_sol   = 0.0 if has_ata else 0.00203928
-    reserve   = 0.0005
-    total_fee = gas_sol + proto_sol + ata_sol
-    return {
-        "gas_sol"  : gas_sol,
-        "proto_sol": proto_sol,
-        "ata_sol"  : ata_sol,
-        "reserve"  : reserve,
-        "total_fee": total_fee,
-        "required" : sol_amount + total_fee + reserve,
-    }
 
 def do_swap(kp, fm, tm, raw_in):
     """
@@ -461,7 +439,6 @@ def do_swap(kp, fm, tm, raw_in):
 
     # ── 1. Jupiter Ultra ─────────────────────────────────
     if use_ultra:
-        ultra_sent = False
         try:
             params = {"inputMint":fm,"outputMint":tm,"amount":raw_in,"taker":pub}
             if JUPITER_REFERRAL_ACCOUNT:
@@ -474,31 +451,29 @@ def do_swap(kp, fm, tm, raw_in):
                     out_amt = int(order.get("outAmount", 0))
                     logging.info(f"[SWAP] Ultra outAmount={out_amt}")
                     if out_amt > 0:
-                        ultra_sent = True
                         txid = sign_and_send(base64.b64decode(order["transaction"]), kp)
-                        confirm_tx(txid)
+                        confirm_tx(txid)   # raises on BOTH failure AND timeout → falls to Normal
                         out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
                         return txid, out_amt / (10**out_dec), order.get("gasless", False)
         except RuntimeError as e:
-            if ultra_sent:
-                raise
             if "Insufficient" in str(e): raise
             logging.info(f"[SWAP] Ultra failed ({e}), trying Normal…")
         except Exception as e:
-            if ultra_sent:
-                raise RuntimeError(f"Ultra swap sent but confirmation failed: {e}")
             logging.info(f"[SWAP] Ultra error ({e}), trying Normal…")
 
-    # ── 2. Jupiter Normal — ONE TX per slippage step ─────
-    # CRITICAL: once a TX is broadcast, STOP. Never send 2nd TX.
-    # This prevents 5-min hangs and double gas charges.
-    slip_mint  = tm if fm == SOL_MINT else fm
-    slip_steps = get_slippage_steps(slip_mint, fm, user_max)
+    # ── 2. Jupiter Normal ────────────────────────────────
+    # For each slippage step:
+    #   1. Get quote + build TX
+    #   2. SIMULATE (free, no gas)
+    #   3. Only SEND if simulation passes
+    # This means slippage failures cost ZERO gas.
+    slip_steps = get_slippage_steps(tm, fm, user_max)
     last_err   = "No route found"
 
     for slip in slip_steps:
         for pair in JUPITER_PAIRS:
             try:
+                # Step 1 — quote
                 qr = requests.get(pair["q"], params={
                     "inputMint"  : fm,
                     "outputMint" : tm,
@@ -507,16 +482,14 @@ def do_swap(kp, fm, tm, raw_in):
                 }, timeout=10)
                 if qr.status_code != 200: continue
                 q = qr.json()
-
                 if "error" in q or "errorCode" in q:
                     last_err = str(q.get("error", q.get("errorCode",""))); continue
-
                 out_amt = int(q.get("outAmount", 0))
                 logging.info(f"[SWAP] {pair['n']} slip={slip/100:.1f}% outAmt={out_amt}")
-
                 if out_amt == 0: last_err = "outAmount=0"; continue
                 if not q.get("routePlan"): last_err = "no routePlan"; continue
 
+                # Step 2 — build TX
                 payload = {
                     "quoteResponse"            : q,
                     "userPublicKey"            : pub,
@@ -525,25 +498,56 @@ def do_swap(kp, fm, tm, raw_in):
                     "dynamicComputeUnitLimit"  : True,
                     "skipUserAccountsCheck"    : True,
                 }
+                if JUPITER_REFERRAL_ACCOUNT: payload["feeAccount"] = JUPITER_REFERRAL_ACCOUNT
                 sr = requests.post(pair["s"], json=payload, timeout=20)
                 if sr.status_code != 200: continue
                 sd = sr.json()
                 if "swapTransaction" not in sd: last_err = "no swapTransaction"; continue
 
-                # ── TX SEND — point of no return ─────────
-                txid = sign_and_send(base64.b64decode(sd["swapTransaction"]), kp)
-                logging.info(f"[SWAP] TX sent {txid[:20]}… confirming…")
+                # Step 3 — sign (needed for simulation)
+                raw_tx  = VersionedTransaction.from_bytes(base64.b64decode(sd["swapTransaction"]))
+                signed  = VersionedTransaction(raw_tx.message, [kp])
+                raw_b64 = base64.b64encode(bytes(signed)).decode()
 
-                # Confirm — strict. Only return on real confirmation.
+                # Step 4 — SIMULATE FIRST (FREE — no gas cost)
+                sim_result = rpc("simulateTransaction", [raw_b64, {
+                    "encoding"              : "base64",
+                    "commitment"            : "processed",
+                    "replaceRecentBlockhash": True,
+                }], _send=True)
+                sim_val = sim_result.get("result", {}).get("value", {})
+                sim_err = sim_val.get("err")
+                if sim_err:
+                    sim_err_s = str(sim_err)
+                    logging.info(f"[SIM] slip={slip/100:.1f}% err={sim_err_s[:60]}")
+                    if "Custom" in sim_err_s and "1}" in sim_err_s:
+                        last_err = f"SLIPPAGE_LOW@{slip}"
+                        break  # escalate — no gas wasted
+                    if "InsufficientFunds" in sim_err_s or "0x1" in sim_err_s:
+                        raise RuntimeError("Insufficient SOL balance for this swap")
+                    # Other sim error — try sending anyway (may be false positive)
+                    logging.warning(f"[SIM] Non-critical sim error, sending anyway: {sim_err_s[:60]}")
+
+                # Step 5 — SEND (only if simulation passed or non-critical error)
+                result = rpc("sendTransaction", [raw_b64, {
+                    "encoding"           : "base64",
+                    "skipPreflight"      : True,
+                    "preflightCommitment": "processed",
+                    "maxRetries"         : 5,
+                }], _send=True)
+                if "error" in result:
+                    last_err = str(result["error"])[:80]; continue
+                txid = result["result"]
+                logging.info(f"[SWAP] TX sent {txid[:20]}…")
+
+                # Step 6 — confirm on-chain
                 try:
                     confirm_tx(txid)
                 except RuntimeError as ce:
                     ce_s = str(ce)
-                    if "SLIPPAGE_TOO_LOW" in ce_s or ("Custom" in ce_s and "1}" in ce_s):
+                    if "SLIPPAGE_TOO_LOW" in ce_s:
                         last_err = f"SLIPPAGE_LOW@{slip}"
-                        logging.info(f"[SWAP] Slippage {slip/100:.1f}% failed on-chain, escalating…")
-                        break  # next slippage step
-                    # timeout OR real failure — raise so user sees real error
+                        break
                     raise
 
                 out_dec = 9 if tm == SOL_MINT else tok_dec(tm)
@@ -552,23 +556,18 @@ def do_swap(kp, fm, tm, raw_in):
             except RuntimeError as e:
                 es = str(e)
                 if "Insufficient" in es: raise
-                if "SLIPPAGE_TOO_LOW" in es:
+                if "SLIPPAGE_LOW" in es or "SLIPPAGE_TOO_LOW" in es:
                     last_err = f"SLIPPAGE_LOW@{slip}"; break
                 last_err = es[:120]; continue
             except Exception as e:
                 last_err = str(e)[:80]; continue
 
-        if "SLIPPAGE_LOW" not in last_err:
-            # Non-slippage error or success — don't loop more slippage steps
-            # (success already returned above; error needs different fix, not more slippage)
-            pass  # let loop continue — sometimes higher slippage helps routing
-
     if "SLIPPAGE_LOW" in last_err:
         max_pct = slip_steps[-1] // 100
         raise RuntimeError(
-            f"⚠️ Slippage up to {max_pct}% is still too low.\n\n"
-            f"Token has very high price impact or buy/sell tax.\n"
-            f"Check 🛡️ Safety before trading."
+            f"❌ Slippage up to {max_pct}% is too low for this token.\n\n"
+            f"This token has very high tax or low liquidity.\n"
+            f"No gas was wasted — simulation detected this before sending."
         )
     raise RuntimeError(f"Swap failed: {last_err}")
 
@@ -1328,13 +1327,10 @@ def _exec_buy(uid,chat_id,mint,sol_amount):
     if not has_wallet(uid):
         bot.send_message(chat_id,"❌ *No trade wallet.*\n\nTap 💼 Wallet → ⚡ Add Trade Wallet",parse_mode="Markdown",reply_markup=kb_wallet(uid)); return
     pub = _users[uid]["pubkey"]; bal = sol_bal(pub)
-    user_toks = token_accs(pub)
-    has_ata   = any(t["mint"]==mint for t in user_toks)
-    fees      = estimate_buy_fees(sol_amount, has_ata=has_ata)
-    if bal < fees["required"]:
+    if bal < sol_amount + 0.002:
         bot.send_message(chat_id,
             f"❌ *Insufficient balance*\n\n"
-            f"Have: `{bal:.4f} SOL`\nNeed: `{fees['required']:.4f} SOL`",
+            f"Have: `{bal:.4f} SOL`\nNeed: `{sol_amount+0.002:.4f} SOL`",
             parse_mode="Markdown",reply_markup=kb_back()); return
 
     # ── EXECUTE IMMEDIATELY — no safety delay ────────────
@@ -1346,9 +1342,11 @@ def _exec_buy(uid,chat_id,mint,sol_amount):
         parse_mode="Markdown")
 
     sp        = 0  # fetch inside thread to not block
-    gas_sol   = fees["gas_sol"]
-    proto_sol = fees["proto_sol"]
-    ata_sol   = fees["ata_sol"]
+    gas_sol   = 0.000005
+    proto_sol = sol_amount * 0.003
+    user_toks = token_accs(pub)
+    has_ata   = any(t["mint"]==mint for t in user_toks)
+    ata_sol   = 0.0 if has_ata else 0.00203928
 
     _exec_buy_final(uid, chat_id, mint, sol_amount, sent.message_id,
         gas_sol, 0, proto_sol, 0, ata_sol, 0, gas_sol+proto_sol+ata_sol, sp)
@@ -1443,7 +1441,7 @@ def _exec_sell(uid,chat_id,mint,pct,to_mint=None):
                     if i<2: time.sleep(2)
     threading.Thread(target=_r,daemon=True).start()
 
-@bot.callback_query_handler(func=lambda c: not c.data.startswith("admin_"))
+@bot.callback_query_handler(func=lambda c:True)
 def handle_cb(call):
     uid=call.from_user.id; data=call.data; usr=u(uid)
     try: bot.answer_callback_query(call.id)
